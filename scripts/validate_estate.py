@@ -7,6 +7,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "manifests" / "estate.json"
 RECONCILIATION = ROOT / "manifests" / "vercel-reconciliation.json"
 
+ALLOWED_CLASSIFICATIONS = {
+    "production",
+    "active_service",
+    "preview_or_staging",
+    "historical",
+    "historical_candidate",
+    "duplicate_candidate",
+    "experimental",
+    "unclassified",
+}
+
 
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
@@ -51,8 +62,12 @@ def main() -> None:
         fail(f"Vercel reconciliation coverage mismatch: missing={missing} extra={extra}")
 
     for entry in mapped:
-        if entry.get("classification") is None:
-            fail(f"Vercel project has no classification: {entry.get('name')}")
+        classification = entry.get("classification")
+        if classification not in ALLOWED_CLASSIFICATIONS:
+            fail(
+                f"invalid Vercel classification for {entry.get('name')}: "
+                f"{classification!r}; allowed={sorted(ALLOWED_CLASSIFICATIONS)}"
+            )
         if entry.get("source_verified") is True and not entry.get("source_repo"):
             fail(f"verified Vercel source has no repository: {entry.get('name')}")
 
