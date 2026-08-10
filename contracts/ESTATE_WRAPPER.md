@@ -25,7 +25,7 @@ Each Vercel project must be classified as exactly one of:
 
 Classification meanings:
 
-- `production` — verified current production deployment with declared source mapping or custom production domain.
+- `production` — verified current production deployment with a declared source repository and production branch. A custom production domain is supporting evidence, not a substitute for source mapping.
 - `active_service` — verified active service deployment without evidence yet that it is a public website.
 - `preview_or_staging` — explicitly non-production preview or staging surface.
 - `historical` — verified retained historical deployment with no current production responsibility.
@@ -58,7 +58,7 @@ Future adapters may inspect GitHub, Vercel, Supabase, Stripe, DNS, and monitorin
 
 ## Required invariants
 
-1. One production surface → one declared source repository.
+1. One production surface → one declared source repository and production branch.
 2. One shared database → one declared canonical migration source.
 3. Unclassified resources remain visible; they are not silently discarded.
 4. Duplicate-looking resources are candidates, not conclusions.
