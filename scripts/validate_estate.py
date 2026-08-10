@@ -70,6 +70,13 @@ def main() -> None:
             )
         if entry.get("source_verified") is True and not entry.get("source_repo"):
             fail(f"verified Vercel source has no repository: {entry.get('name')}")
+        if classification == "production":
+            if not entry.get("source_repo"):
+                fail(f"production Vercel project has no source repository: {entry.get('name')}")
+            if not entry.get("production_branch"):
+                fail(f"production Vercel project has no production branch: {entry.get('name')}")
+            if entry.get("source_verified") is not True:
+                fail(f"production Vercel project source is not verified: {entry.get('name')}")
 
     safety = reconciliation.get("safety", {})
     for key in ("delete_projects", "change_domains", "change_production_deployments", "change_supabase"):
