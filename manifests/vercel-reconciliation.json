@@ -1,0 +1,52 @@
+{
+  "schema_version": "0.1.0",
+  "observed_at": "2026-08-09",
+  "classification_policy": {
+    "production": "Verified current production deployment with declared source mapping or custom production domain.",
+    "active_service": "Verified active service deployment without evidence yet that it is a public website.",
+    "historical_candidate": "Active or previously production-deployed surface that appears superseded but is not safe to remove without domain/source review.",
+    "duplicate_candidate": "Name or role overlaps another surface; deletion prohibited until source, domain, and traffic ownership are verified.",
+    "experimental": "Clearly experimental/demo/generated surface.",
+    "unclassified": "Observed but not yet sufficiently reconciled."
+  },
+  "projects": [
+    {"name":"mirrornode-platform","classification":"production","source_repo":"mirrornode/mirrornode-platform","source_verified":true,"production_branch":"main","custom_domains":["mirrornode.xyz"],"notes":"Current public product surface; READY production deployment verified."},
+    {"name":"mirrornode-backend","classification":"active_service","source_repo":"mirrornode/mirrornode-py","source_verified":true,"production_branch":"main","custom_domains":["api.mirrornode.xyz"],"notes":"Current API surface; Vercel project name differs from owning GitHub repository."},
+    {"name":"mirrornode","classification":"active_service","source_repo":"mirrornode/mirrornode","source_verified":true,"production_branch":"main","custom_domains":[],"notes":"READY production deployment verified; no custom production domain observed in deployment aliases."},
+    {"name":"mirrornode-oracle","classification":"active_service","source_repo":"mirrornode/mirrornode","source_verified":true,"production_branch":"main","custom_domains":[],"notes":"Oracle deployment is sourced from the mirrornode monorepo; separate project-level service surface."},
+    {"name":"osiris","classification":"historical_candidate","source_repo":"mirrornode/osiris","source_verified":true,"production_branch":"main","custom_domains":[],"notes":"Has long production deployment history but current public Osiris offer is implemented in mirrornode-platform; retain until role and traffic are verified."},
+    {"name":"mirrornode-homepage","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Latest production deployment observed via CLI with no Git metadata; likely overlaps public homepage responsibility now carried by mirrornode-platform."},
+    {"name":"oracle","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Potential overlap with mirrornode-oracle; requires deployment/source/domain verification."},
+    {"name":"public","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Potential overlap with public MIRRORNODE surface; requires verification."},
+    {"name":"theia-core","classification":"unclassified","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Observed deployment project; source and current role not yet reconciled."},
+    {"name":"osiris-ui","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Likely overlaps historical Osiris UI surface; verification required."},
+    {"name":"osiris-pay","classification":"unclassified","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Payment-related deployment surface; retain until ownership and Stripe boundary are verified."},
+    {"name":"osiris-ui-gl6f","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Generated-name Osiris UI deployment; likely duplicate candidate, not deletion-ready."},
+    {"name":"osiris-ui-agent","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Agent-derived Osiris UI surface; likely duplicate candidate, not deletion-ready."},
+    {"name":"mirrornode-py","classification":"unclassified","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Separate deployment project exists in addition to mirrornode-backend sourced from mirrornode-py; requires role comparison."},
+    {"name":"mirrornode-hub","classification":"unclassified","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Observed deployment; current role relative to platform/core-hub not yet reconciled."},
+    {"name":"branchofio","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Legacy/experimental naming; no destructive action without verification."},
+    {"name":"templeofio","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Legacy/experimental naming; no destructive action without verification."},
+    {"name":"rotan-resonance","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Experimental ROTAN surface."},
+    {"name":"rotan-resonance-zx1o","classification":"duplicate_candidate","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Generated duplicate candidate of rotan-resonance."},
+    {"name":"vite-react","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Generic scaffold/demo surface."},
+    {"name":"biometric-integrated-meditative-rpg","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Prototype/experimental surface."},
+    {"name":"rotan-neural-modality-kids-game","classification":"experimental","source_repo":"mirrornode/Rotan-neural-modality-kids-game","source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Known family prototype; Vercel-to-Git mapping still needs direct deployment verification."},
+    {"name":"spiral-app-react","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Prototype/experimental surface."},
+    {"name":"fusion-energy-display-web-component-grok-files","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"Prototype/generated surface."},
+    {"name":"flags-sdk-hypertune-nextjs","classification":"experimental","source_repo":null,"source_verified":false,"production_branch":null,"custom_domains":[],"notes":"SDK/example project; not presumed production."}
+  ],
+  "verified_findings": [
+    "mirrornode.xyz is currently served by Vercel project mirrornode-platform from GitHub repo mirrornode/mirrornode-platform main.",
+    "api.mirrornode.xyz is currently served by Vercel project mirrornode-backend from GitHub repo mirrornode/mirrornode-py main.",
+    "Vercel project mirrornode-oracle is currently sourced from GitHub repo mirrornode/mirrornode main.",
+    "Vercel project mirrornode is currently sourced from GitHub repo mirrornode/mirrornode main.",
+    "Vercel project osiris has an established production deployment history sourced from GitHub repo mirrornode/osiris, but its current product role requires review against mirrornode-platform."
+  ],
+  "safety": {
+    "delete_projects": false,
+    "change_domains": false,
+    "change_production_deployments": false,
+    "change_supabase": false
+  }
+}
