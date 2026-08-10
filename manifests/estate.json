@@ -1,0 +1,70 @@
+{
+  "schema_version": "0.1.0",
+  "estate": "MIRRORNODE",
+  "authority": {
+    "cross_project_contract": "MIRRORNODE-INFRA",
+    "application_implementation": "owning repository",
+    "production_database_automation": "disabled_pending_canonical_migration_source"
+  },
+  "shared_services": {
+    "supabase": {
+      "logical_name": "Mirrornode OS",
+      "status": "active_healthy",
+      "migration_count_observed": 7,
+      "public_table_count_observed": 6,
+      "github_production_deploy": false,
+      "canonical_migration_repository": null,
+      "canonical_migration_working_directory": null
+    },
+    "vercel": {
+      "team": "Mirrornode",
+      "observed_project_count": 25
+    },
+    "github": {
+      "owner": "mirrornode"
+    }
+  },
+  "core_repositories": [
+    {"name": "mirrornode-platform", "role": "public_product_surface", "supabase_runtime_consumer": true},
+    {"name": "mirrornode-backend", "role": "backend_surface", "supabase_runtime_consumer": "unverified"},
+    {"name": "mirrornode-operator-console", "role": "private_operator_surface", "supabase_runtime_consumer": "unverified"},
+    {"name": "mirrornode-agent-runtime", "role": "agent_runtime", "supabase_runtime_consumer": "unverified"},
+    {"name": "MIRRORNODE-CORE-HUB", "role": "governance_canon", "supabase_runtime_consumer": false},
+    {"name": "mirrornode-workspace", "role": "private_workspace", "supabase_runtime_consumer": "unverified"},
+    {"name": "MIRRORNODE-INFRA", "role": "estate_wrapper", "supabase_runtime_consumer": false}
+  ],
+  "vercel_projects_observed": [
+    "mirrornode-platform",
+    "oracle",
+    "mirrornode-oracle",
+    "branchofio",
+    "templeofio",
+    "mirrornode-backend",
+    "mirrornode-py",
+    "mirrornode",
+    "public",
+    "mirrornode-homepage",
+    "theia-core",
+    "osiris",
+    "osiris-ui",
+    "osiris-pay",
+    "osiris-ui-gl6f",
+    "rotan-resonance",
+    "rotan-resonance-zx1o",
+    "vite-react",
+    "biometric-integrated-meditative-rpg",
+    "rotan-neural-modality-kids-game",
+    "osiris-ui-agent",
+    "spiral-app-react",
+    "fusion-energy-display-web-component-grok-files",
+    "flags-sdk-hypertune-nextjs",
+    "mirrornode-hub"
+  ],
+  "invariants": [
+    "No secrets or private credentials in this repository.",
+    "No production database deployment from GitHub until canonical migration ownership is assigned.",
+    "Every production website must map to exactly one owning source repository.",
+    "Every shared service dependency must declare its owning repository or remain explicitly unverified.",
+    "Historical and duplicate deployment surfaces must be classified before deletion or consolidation."
+  ]
+}
