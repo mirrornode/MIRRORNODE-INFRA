@@ -12,14 +12,27 @@ Each deployable surface must map to one source repository and one default produc
 
 ### 2. Deployment layer — Vercel
 
-Each Vercel project must be classified as one of:
+Each Vercel project must be classified as exactly one of:
 
 - `production`
+- `active_service`
 - `preview_or_staging`
 - `historical`
+- `historical_candidate`
 - `duplicate_candidate`
 - `experimental`
 - `unclassified`
+
+Classification meanings:
+
+- `production` — verified current production deployment with a declared source repository and production branch. A custom production domain is supporting evidence, not a substitute for source mapping.
+- `active_service` — verified active service deployment without evidence yet that it is a public website.
+- `preview_or_staging` — explicitly non-production preview or staging surface.
+- `historical` — verified retained historical deployment with no current production responsibility.
+- `historical_candidate` — appears superseded, but is not safe to retire until source, domain, and traffic ownership are verified.
+- `duplicate_candidate` — overlaps another surface by name or role; deletion is prohibited until source, domain, and traffic ownership are verified.
+- `experimental` — prototype, demo, generated, or intentionally experimental surface.
+- `unclassified` — observed but not yet sufficiently reconciled.
 
 No project is deleted merely because its name resembles another project. Consolidation requires evidence of repository, domain, and deployment ownership.
 
@@ -45,7 +58,7 @@ Future adapters may inspect GitHub, Vercel, Supabase, Stripe, DNS, and monitorin
 
 ## Required invariants
 
-1. One production surface → one declared source repository.
+1. One production surface → one declared source repository and production branch.
 2. One shared database → one declared canonical migration source.
 3. Unclassified resources remain visible; they are not silently discarded.
 4. Duplicate-looking resources are candidates, not conclusions.
