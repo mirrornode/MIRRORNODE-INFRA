@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from repo_steward.admin import AdminAction, RepoAdmin
+from repo_steward.admin import APPROVED_ADVISORY_LANES, AdminAction, RepoAdmin
 from repo_steward.checker import RepoChecker, Verdict
 
 
@@ -64,14 +64,17 @@ class RepoStewardTests(unittest.TestCase):
         admin = RepoAdmin()
         proposal = admin.propose('mirrornode/example', AdminAction.OPEN_PR, 'repair')
         self.assertTrue(proposal.requires_operator_approval)
+        self.assertTrue(proposal.requires_advisory_attestation)
         with self.assertRaises(PermissionError):
             admin.execute(proposal)
 
-    def test_all_mutations_are_operator_gated(self):
+    def test_all_mutations_require_dual_control(self):
         admin = RepoAdmin()
         for action in AdminAction:
             proposal = admin.propose('mirrornode/example', action, 'test')
             self.assertTrue(proposal.requires_operator_approval)
+            self.assertTrue(proposal.requires_advisory_attestation)
+            self.assertEqual(proposal.approved_advisory_lanes, APPROVED_ADVISORY_LANES)
 
 
 if __name__ == '__main__':
