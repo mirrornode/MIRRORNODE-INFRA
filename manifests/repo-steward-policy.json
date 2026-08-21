@@ -2,6 +2,18 @@
   "schema_version": "0.1.0",
   "agent": "REPO_STEWARD",
   "mode": "READ_ONLY_CHECKER_WITH_PROPOSAL_ONLY_ADMIN",
+  "authorization_boundary": {
+    "human_operator_required": true,
+    "bot_only_mutation_forbidden": true,
+    "delegated_merge_authority_forbidden": true,
+    "write_transport_present": false,
+    "advisory_lanes": [
+      "OPENAI_ASSISTANT",
+      "PERPLEXITY",
+      "CLAUDE"
+    ],
+    "rule": "Any future repository mutation requires the human Operator as an explicit authorizing party. Advisory lanes may inspect, recommend, prepare, or independently review, but may not independently authorize or execute repository administration."
+  },
   "repositories": [
     {
       "repository": "mirrornode/MIRRORNODE-CORE-HUB",
@@ -80,6 +92,8 @@
     "No component may certify its own repair as merge authority.",
     "A review bound to an ancestor SHA does not clear a changed head.",
     "CI success never implies approval, deployment, or merge authority.",
-    "Permission expansion, ruleset mutation, and merge require explicit Operator approval."
+    "No autonomous agent, bot identity, service account, coding agent, or advisory model may independently administer repositories.",
+    "Every future write path must require explicit human Operator authorization and must fail closed if that authorization is absent or unverifiable.",
+    "Permission expansion, ruleset mutation, credential changes, direct-default-branch writes, destructive actions, deployment enablement, and merge remain closed to non-Operator authority."
   ]
 }
