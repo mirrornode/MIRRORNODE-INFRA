@@ -30,9 +30,11 @@ This repository is the integration boundary above individual application reposit
 
 The checker is GET-only. The administration engine is proposal-only and deliberately has no GitHub mutation transport in v0.1.
 
-Every future repository write requires explicit human Operator authorization. No autonomous agent, bot identity, service account, coding agent, or advisory model may independently administer repositories. Approved OpenAI, Perplexity, and Claude lanes may inspect, recommend, prepare, or independently review, but do not acquire repository authority from that role.
+Every future Repo Steward repository write requires dual control: explicit human Operator authorization plus at least one independent attestation from an approved OpenAI, Perplexity, or Claude advisory lane. Neither side may independently cross the governed write boundary. The advisory lane remains evidentiary/reviewing rather than authoritative.
 
-See `docs/REPO_STEWARD_AGENT_STACK_V0_1.md` and `manifests/repo-steward-policy.json`.
+No autonomous agent, bot identity, service account, coding agent, or advisory model may independently administer repositories.
+
+See `docs/REPO_STEWARD_AGENT_STACK_V0_1.md`, `docs/REPO_STEWARD_SECURITY_BOUNDARY_V0_1.md`, and `manifests/repo-steward-policy.json`.
 
 ## Non-goals
 
@@ -41,6 +43,7 @@ See `docs/REPO_STEWARD_AGENT_STACK_V0_1.md` and `manifests/repo-steward-policy.j
 - bypassing application-level repositories
 - autonomous repository administration
 - bot-only mutation or merge paths
+- Operator-only Repo Steward mutation without the second advisory control
 - self-certifying repairs
 - automatically mutating production infrastructure without an explicit approval boundary
 
