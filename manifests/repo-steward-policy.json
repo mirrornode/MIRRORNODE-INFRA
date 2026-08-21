@@ -1,0 +1,85 @@
+{
+  "schema_version": "0.1.0",
+  "agent": "REPO_STEWARD",
+  "mode": "READ_ONLY_CHECKER_WITH_PROPOSAL_ONLY_ADMIN",
+  "repositories": [
+    {
+      "repository": "mirrornode/MIRRORNODE-CORE-HUB",
+      "criticality": "constitutional",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": true,
+      "required_workflows": ["MIRRORNODE Audit", "Canon Gate"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "OPEN_PR", "REQUEST_REVIEW"]
+    },
+    {
+      "repository": "mirrornode/mirrornode-agent-runtime",
+      "criticality": "execution",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": true,
+      "required_workflows": ["PR Validation"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "PROPOSE_WORKFLOW", "OPEN_PR", "REQUEST_REVIEW"]
+    },
+    {
+      "repository": "mirrornode/mirrornode-operator-console",
+      "criticality": "operator_surface",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": true,
+      "required_workflows": ["PR Validation", "Mainline Audit"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "PROPOSE_WORKFLOW", "OPEN_PR", "REQUEST_REVIEW"]
+    },
+    {
+      "repository": "mirrornode/mirrornode-platform",
+      "criticality": "customer_production",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": false,
+      "required_workflows": ["CI", "Canon Gate"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "PROPOSE_WORKFLOW", "OPEN_PR", "REQUEST_REVIEW"]
+    },
+    {
+      "repository": "mirrornode/mirrornode-osiris",
+      "criticality": "evidence_processing",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": true,
+      "required_workflows": ["PR Validation"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "PROPOSE_WORKFLOW", "OPEN_PR", "REQUEST_REVIEW"]
+    },
+    {
+      "repository": "mirrornode/mn-supply-continuity",
+      "criticality": "continuity_state",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": true,
+      "required_workflows": ["PR Validation"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "PROPOSE_WORKFLOW", "OPEN_PR", "REQUEST_REVIEW"]
+    },
+    {
+      "repository": "mirrornode/mirrornode-parallax",
+      "criticality": "public_front_of_house",
+      "enabled": true,
+      "require_ci": true,
+      "require_exact_head_review": false,
+      "required_workflows": ["Parallax Front-of-House Gate"],
+      "merge_authority": "OPERATOR",
+      "admin_actions": ["PROPOSE_FILE", "PROPOSE_WORKFLOW", "OPEN_PR", "REQUEST_REVIEW"]
+    }
+  ],
+  "invariants": [
+    "Checker is GET-only and cannot mutate GitHub.",
+    "Repo Admin v0.1 has no mutation transport and cannot execute proposals.",
+    "No component may certify its own repair as merge authority.",
+    "A review bound to an ancestor SHA does not clear a changed head.",
+    "CI success never implies approval, deployment, or merge authority.",
+    "Permission expansion, ruleset mutation, and merge require explicit Operator approval."
+  ]
+}
