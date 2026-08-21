@@ -70,6 +70,61 @@ class RepoChecker:
         levels = {Verdict.FAIL: 3, Verdict.HOLD: 2, Verdict.UNKNOWN: 1, Verdict.PASS: 0}
         return max((f.verdict for f in findings), key=lambda v: levels[v], default=Verdict.UNKNOWN)
 
+    def _check_exact_head_review(self, full_name: str, pr: dict[str, Any], sha: str) -> list[Finding]:
+        number = pr["number"]
+        findings: list[Finding] = []
+
+        comments = self.reader.get(f"/repos/{full_name}/issues/{number}/comments?per_page=100")
+        request_bound = any(
+            sha in (comment.get("body") or "") and "review" in (comment.get("body") or "").lower()
+            for comment in comments
+        )
+        findings.append(Finding(
+            "EXACT_HEAD_REVIEW_REQUEST_BOUND" if request_bound else "EXACT_HEAD_REVIEW_REQUEST_ABSENT",
+            Verdict.PASS if request_bound else Verdict.HOLD,
+            f"PR #{number} {'has' if request_bound else 'does not have'} an observed review request naming its current head.",
+            {"sha": sha},
+        ))
+
+        reviews = self.reader.get(f"/repos/{full_name}/pulls/{number}/reviews?per_page=100")
+        exact = [
+            review for review in reviews
+            if review.get("commit_id") == sha and str(review.get("state", "")).upper() != "PENDING"
+        ]
+        if not exact:
+            findings.append(Finding(
+                "EXACT_HEAD_REVIEW_NOT_SUBMITTED",
+                Verdict.HOLD,
+                f"PR #{number} has no submitted review bound to its current head.",
+                {"sha": sha},
+            ))
+            return findings
+
+        states = {str(review.get("state", "")).upper() for review in exact}
+        reviewers = sorted({(review.get("user") or {}).get("login", "unknown") for review in exact})
+        if "CHANGES_REQUESTED" in states:
+            findings.append(Finding(
+                "EXACT_HEAD_REVIEW_CHANGES_REQUESTED",
+                Verdict.FAIL,
+                f"PR #{number} has a current-head review requesting changes.",
+                {"sha": sha, "states": sorted(states), "reviewers": reviewers},
+            ))
+        elif "APPROVED" in states:
+            findings.append(Finding(
+                "EXACT_HEAD_REVIEW_APPROVED",
+                Verdict.PASS,
+                f"PR #{number} has an approving review bound to its current head.",
+                {"sha": sha, "states": sorted(states), "reviewers": reviewers},
+            ))
+        else:
+            findings.append(Finding(
+                "EXACT_HEAD_REVIEW_NONAPPROVING",
+                Verdict.HOLD,
+                f"PR #{number} has current-head review activity, but no machine-verifiable approving review. Manual/provider-specific disposition is required.",
+                {"sha": sha, "states": sorted(states), "reviewers": reviewers},
+            ))
+        return findings
+
     def check_repo(self, repo_cfg: dict[str, Any]) -> RepoReport:
         full_name = repo_cfg["repository"]
         findings: list[Finding] = []
@@ -101,8 +156,8 @@ class RepoChecker:
                 findings.append(Finding("PR_HEAD_UNKNOWN", Verdict.FAIL, f"PR #{pr.get('number')} has no observable head SHA."))
                 continue
             runs = self.reader.get(f"/repos/{full_name}/actions/runs?head_sha={sha}&event=pull_request&per_page=100").get("workflow_runs", [])
-            bad = [r for r in runs if r.get("conclusion") not in (None, "success", "skipped")]
-            pending = [r for r in runs if r.get("status") != "completed"]
+            bad = [run for run in runs if run.get("conclusion") not in (None, "success", "skipped")]
+            pending = [run for run in runs if run.get("status") != "completed"]
             if bad:
                 findings.append(Finding("PR_CI_FAILED", Verdict.FAIL, f"PR #{pr['number']} has failed CI on its current head.", {"sha": sha}))
             elif pending:
@@ -113,18 +168,11 @@ class RepoChecker:
                 findings.append(Finding("PR_CI_GREEN", Verdict.PASS, f"PR #{pr['number']} CI is green on current head.", {"sha": sha}))
 
             if repo_cfg.get("require_exact_head_review", False):
-                comments = self.reader.get(f"/repos/{full_name}/issues/{pr['number']}/comments?per_page=100")
-                bound = any(sha in (c.get("body") or "") and "review" in (c.get("body") or "").lower() for c in comments)
-                findings.append(Finding(
-                    "EXACT_HEAD_REVIEW_REQUEST_BOUND" if bound else "EXACT_HEAD_REVIEW_UNBOUND",
-                    Verdict.PASS if bound else Verdict.HOLD,
-                    f"PR #{pr['number']} {'has' if bound else 'does not have'} an observed review request naming its current head.",
-                    {"sha": sha},
-                ))
+                findings.extend(self._check_exact_head_review(full_name, pr, sha))
 
         return RepoReport(full_name, self._combine(findings), findings)
 
     def check_all(self) -> dict[str, Any]:
         reports = [self.check_repo(cfg) for cfg in self.policy["repositories"] if cfg.get("enabled", True)]
-        overall = self._combine([Finding("REPO", r.verdict, r.repository) for r in reports])
-        return {"schema_version": "0.1.0", "overall": overall.value, "reports": [r.as_dict() for r in reports]}
+        overall = self._combine([Finding("REPO", report.verdict, report.repository) for report in reports])
+        return {"schema_version": "0.1.0", "overall": overall.value, "reports": [report.as_dict() for report in reports]}
