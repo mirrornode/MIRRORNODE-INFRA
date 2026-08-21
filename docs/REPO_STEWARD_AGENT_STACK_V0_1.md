@@ -17,7 +17,7 @@ Repo Steward is MIRRORNODE's repository-integrity and repository-administration 
 
 ## Processing sequence
 
-`SURVEYOR -> SENTINEL -> NOTARY -> WARDEN -> REPO STEWARD -> CUSTODIAN proposal -> Operator gate`
+`SURVEYOR -> SENTINEL -> NOTARY -> WARDEN -> REPO STEWARD -> CUSTODIAN proposal -> Operator + approved advisory attestation -> owning-repo checks/review`
 
 A repository report is valid only for the observed target state. If a PR head moves, exact-head review evidence and applicable CI evidence must be recomputed.
 
@@ -38,23 +38,30 @@ Repository inventory, workflow inventory, default-head resolution, CI inspection
 
 ### Proposal-producing
 
-Missing workflow/template proposals, bounded branch/PR plans, review requests, dependency/config repair plans, and repository-policy remediation packets.
+Missing workflow/template proposals, bounded branch/PR plans, review requests, dependency/config repair plans, and repository-policy remediation packets. Proposal generation itself does not cross the repository-write boundary.
 
-### Operator-gated
+### Dual-control write boundary
 
-Merge, ruleset or branch-protection mutation, permission expansion, credential changes, deployment enablement, destructive repository actions, and any change that could alter constitutional or production authority.
+Any future Repo Steward repository write requires both:
+
+1. explicit human Operator authorization bound to the target/action; and
+2. at least one independent attestation from an approved OpenAI, Perplexity, or Claude advisory lane bound to the same target/action.
+
+The advisory attestation is a second control, not delegated authority. Neither Operator-only nor advisory-only Repo Steward mutation is conformant.
+
+Merge, ruleset or branch-protection mutation, permission expansion, credential changes, deployment enablement, destructive repository actions, direct default-branch writes, and authority-affecting changes remain closed unless separately permitted under an equally strong or stronger dual-control policy.
 
 ## Anti-self-certification invariant
 
-The component that detects or repairs a defect cannot treat its own output as sufficient clearance. Repairs require independent checks/review according to the owning repository policy, and the Operator remains the final merge authority.
+The component that detects or repairs a defect cannot treat its own output as sufficient clearance. Repairs require independent checks/review according to the owning repository policy, and the Operator remains the human merge authority.
 
 ## Implementation
 
 - `repo_steward/checker.py` — GET-only GitHub evidence collection and normalized repository reports.
-- `repo_steward/admin.py` — mutation proposal model with execution intentionally absent.
+- `repo_steward/admin.py` — mutation proposal model with execution intentionally absent and dual-control requirements encoded.
 - `repo_steward/cli.py` — machine-readable estate check entrypoint.
 - `manifests/repo-steward-policy.json` — active repository policy and authority boundary.
 
 ## Future phases
 
-Phase 1 may add a write adapter limited to branch creation, file proposals, PR opening, and review requests. Each mutation must be policy-allowed, auditable, and incapable of writing directly to protected/default branches. Merge/ruleset/permission operations remain explicit Operator actions.
+Phase 1 may add a write adapter limited to policy-allowed mutations. It is non-conformant unless it verifies the Operator authorization and approved advisory attestation independently, emits an audit record, fails closed on ambiguity, and never treats its own output as clearance. Platform-level GitHub rulesets/permissions should eventually enforce the same boundary so the control cannot be bypassed outside Repo Steward.
