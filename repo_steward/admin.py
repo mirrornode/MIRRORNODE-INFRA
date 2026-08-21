@@ -28,15 +28,11 @@ class RepoAdmin:
     """Proposal engine for repository administration.
 
     v0.1 deliberately contains no GitHub write transport. It can construct
-    bounded proposals but cannot execute them. A future adapter must enforce
-    the policy manifest and explicit Operator approval before any mutation.
+    bounded proposals but cannot execute them. Any future mutation transport
+    must require explicit human Operator authorization for every write action.
+    No bot, service account, coding agent, or advisory model may independently
+    cross the repository-write boundary.
     """
-
-    ALWAYS_OPERATOR_GATED = {
-        AdminAction.MERGE_PR,
-        AdminAction.UPDATE_RULESET,
-        AdminAction.EXPAND_PERMISSION,
-    }
 
     def propose(self, repository: str, action: AdminAction, rationale: str, **payload: Any) -> AdminProposal:
         return AdminProposal(
@@ -44,10 +40,10 @@ class RepoAdmin:
             action=action,
             rationale=rationale,
             payload=payload,
-            requires_operator_approval=action in self.ALWAYS_OPERATOR_GATED,
+            requires_operator_approval=True,
         )
 
     def execute(self, proposal: AdminProposal) -> None:
         raise PermissionError(
-            "Repo Steward v0.1 is proposal-only for mutations; execution transport is intentionally absent."
+            "Repo Steward v0.1 is proposal-only; all repository writes are closed and execution transport is absent."
         )
