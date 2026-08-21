@@ -8,12 +8,13 @@ from repo_steward.checker import RepoChecker, Verdict
 
 
 class FakeReader:
-    def __init__(self, review_state='APPROVED'):
+    def __init__(self, review_state='APPROVED', protected=True):
         self.review_state = review_state
+        self.protected = protected
 
     def get(self, path):
         if path.endswith('/branches/main'):
-            return {'commit': {'sha': 'abc123'}}
+            return {'commit': {'sha': 'abc123'}, 'protected': self.protected}
         if path.endswith('/actions/workflows'):
             return {'workflows': [{'name': 'PR Validation'}]}
         if '/pulls?' in path:
@@ -38,6 +39,7 @@ class RepoStewardTests(unittest.TestCase):
                 'enabled': True,
                 'require_ci': True,
                 'require_exact_head_review': True,
+                'require_protected_default_branch': True,
                 'required_workflows': ['PR Validation'],
             }]
         }
@@ -48,16 +50,20 @@ class RepoStewardTests(unittest.TestCase):
             path.write_text(json.dumps(self.policy()), encoding='utf-8')
             return RepoChecker(path, reader=reader).check_all()
 
-    def test_checker_passes_bound_green_approved_repo(self):
-        report = self.run_checker(FakeReader('APPROVED'))
+    def test_checker_passes_bound_green_approved_protected_repo(self):
+        report = self.run_checker(FakeReader('APPROVED', True))
         self.assertEqual(report['overall'], Verdict.PASS.value)
 
+    def test_unprotected_default_branch_fails(self):
+        report = self.run_checker(FakeReader('APPROVED', False))
+        self.assertEqual(report['overall'], Verdict.FAIL.value)
+
     def test_nonapproving_review_does_not_clear_head(self):
-        report = self.run_checker(FakeReader('COMMENTED'))
+        report = self.run_checker(FakeReader('COMMENTED', True))
         self.assertEqual(report['overall'], Verdict.HOLD.value)
 
     def test_changes_requested_fails_head(self):
-        report = self.run_checker(FakeReader('CHANGES_REQUESTED'))
+        report = self.run_checker(FakeReader('CHANGES_REQUESTED', True))
         self.assertEqual(report['overall'], Verdict.FAIL.value)
 
     def test_admin_execution_is_absent(self):
