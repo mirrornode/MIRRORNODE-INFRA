@@ -59,6 +59,16 @@ class GitHubReader:
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"github GET {path} failed: {exc.code}") from exc
 
+    def get_optional(self, path: str) -> tuple[Any | None, int | None]:
+        req = urllib.request.Request(f"{self.api_base}{path}", headers={"Accept": "application/vnd.github+json"})
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return json.load(response), response.status
+        except urllib.error.HTTPError as exc:
+            return None, exc.code
+
 
 class RepoChecker:
     def __init__(self, policy_path: str | Path = "manifests/repo-steward-policy.json", reader: GitHubReader | None = None) -> None:
@@ -99,6 +109,57 @@ class RepoChecker:
             findings.append(Finding("EXACT_HEAD_REVIEW_NONAPPROVING", Verdict.HOLD, f"PR #{number} has current-head review activity, but no machine-verifiable approving review. Manual/provider-specific disposition is required.", {"sha": sha, "states": sorted(states), "reviewers": reviewers}))
         return findings
 
+    def _check_platform_protection(self, full_name: str, default_branch: str, branch: dict[str, Any]) -> list[Finding]:
+        findings: list[Finding] = []
+        if branch.get("protected") is False:
+            return [Finding("PLATFORM_PROTECTION_FAIL", Verdict.FAIL, f"Default branch `{default_branch}` is unprotected; direct platform bypass remains possible.")]
+        if branch.get("protected") is not True:
+            return [Finding("PLATFORM_PROTECTION_HOLD", Verdict.HOLD, f"Protection state for `{default_branch}` could not be verified.")]
+
+        protection, status = self.reader.get_optional(f"/repos/{full_name}/branches/{default_branch}/protection")
+        if status != 200 or not isinstance(protection, dict):
+            return [Finding("PLATFORM_PROTECTION_HOLD", Verdict.HOLD, f"`{default_branch}` is reported protected, but effective branch-protection controls could not be fully inspected.", {"http_status": status})]
+
+        failures: list[str] = []
+        holds: list[str] = []
+        pr = protection.get("required_pull_request_reviews")
+        if not isinstance(pr, dict):
+            failures.append("pull request reviews are not required")
+        else:
+            if int(pr.get("required_approving_review_count") or 0) < 1:
+                failures.append("minimum approving review count is below 1")
+            if pr.get("dismiss_stale_reviews") is not True:
+                failures.append("stale approvals are not dismissed")
+            if pr.get("require_last_push_approval") is not True:
+                failures.append("latest-push approval is not required")
+
+        checks = protection.get("required_status_checks")
+        if not isinstance(checks, dict):
+            failures.append("required status checks are absent")
+        elif checks.get("strict") is not True:
+            failures.append("branch-up-to-date status-check enforcement is disabled")
+
+        conversations = protection.get("required_conversation_resolution")
+        if not isinstance(conversations, dict) or conversations.get("enabled") is not True:
+            failures.append("conversation resolution is not required")
+
+        if (protection.get("allow_force_pushes") or {}).get("enabled") is True:
+            failures.append("force pushes are allowed")
+        if (protection.get("allow_deletions") or {}).get("enabled") is True:
+            failures.append("branch deletion is allowed")
+
+        restrictions = protection.get("restrictions")
+        if restrictions is None:
+            holds.append("push/bypass actor restrictions are not fully observable from this protection response")
+
+        if failures:
+            findings.append(Finding("PLATFORM_PROTECTION_FAIL", Verdict.FAIL, f"`{default_branch}` protection contradicts required policy.", {"failures": failures, "holds": holds}))
+        elif holds:
+            findings.append(Finding("PLATFORM_PROTECTION_HOLD", Verdict.HOLD, f"`{default_branch}` protection is present but cannot yet be completely certified.", {"holds": holds}))
+        else:
+            findings.append(Finding("PLATFORM_PROTECTION_PASS", Verdict.PASS, f"`{default_branch}` effective branch protection satisfies the observable Repo Steward baseline."))
+        return findings
+
     def check_repo(self, repo_cfg: dict[str, Any]) -> RepoReport:
         full_name = repo_cfg["repository"]
         findings: list[Finding] = []
@@ -116,13 +177,7 @@ class RepoChecker:
             findings.append(Finding("HEAD_BOUND", Verdict.PASS, "Default-branch head established.", {"sha": head_sha}))
 
         if repo_cfg.get("require_protected_default_branch", False):
-            protected = branch.get("protected")
-            if protected is True:
-                findings.append(Finding("DEFAULT_BRANCH_PROTECTED", Verdict.PASS, f"Default branch `{default_branch}` is protected."))
-            elif protected is False:
-                findings.append(Finding("DEFAULT_BRANCH_UNPROTECTED", Verdict.FAIL, f"Default branch `{default_branch}` is not protected; direct platform bypass remains possible."))
-            else:
-                findings.append(Finding("DEFAULT_BRANCH_PROTECTION_UNKNOWN", Verdict.HOLD, f"Protection state for `{default_branch}` could not be verified."))
+            findings.extend(self._check_platform_protection(full_name, default_branch, branch))
 
         workflows = self.reader.get(f"/repos/{full_name}/actions/workflows").get("workflows", [])
         names = {w.get("name") for w in workflows}
