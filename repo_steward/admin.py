@@ -15,6 +15,9 @@ class AdminAction(str, Enum):
     EXPAND_PERMISSION = "EXPAND_PERMISSION"
 
 
+APPROVED_ADVISORY_LANES = ("OPENAI_ASSISTANT", "PERPLEXITY", "CLAUDE")
+
+
 @dataclass(frozen=True)
 class AdminProposal:
     repository: str
@@ -22,6 +25,8 @@ class AdminProposal:
     rationale: str
     payload: dict[str, Any]
     requires_operator_approval: bool
+    requires_advisory_attestation: bool
+    approved_advisory_lanes: tuple[str, ...]
 
 
 class RepoAdmin:
@@ -29,9 +34,11 @@ class RepoAdmin:
 
     v0.1 deliberately contains no GitHub write transport. It can construct
     bounded proposals but cannot execute them. Any future mutation transport
-    must require explicit human Operator authorization for every write action.
-    No bot, service account, coding agent, or advisory model may independently
-    cross the repository-write boundary.
+    must require dual control: explicit human Operator authorization plus at
+    least one independent attestation from an approved advisory lane.
+
+    Advisory lanes can inspect, prepare, recommend, or review. They cannot
+    independently authorize or execute repository administration.
     """
 
     def propose(self, repository: str, action: AdminAction, rationale: str, **payload: Any) -> AdminProposal:
@@ -41,6 +48,8 @@ class RepoAdmin:
             rationale=rationale,
             payload=payload,
             requires_operator_approval=True,
+            requires_advisory_attestation=True,
+            approved_advisory_lanes=APPROVED_ADVISORY_LANES,
         )
 
     def execute(self, proposal: AdminProposal) -> None:
