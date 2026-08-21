@@ -8,6 +8,9 @@ from repo_steward.checker import RepoChecker, Verdict
 
 
 class FakeReader:
+    def __init__(self, review_state='APPROVED'):
+        self.review_state = review_state
+
     def get(self, path):
         if path.endswith('/branches/main'):
             return {'commit': {'sha': 'abc123'}}
@@ -19,14 +22,17 @@ class FakeReader:
             return {'workflow_runs': [{'status': 'completed', 'conclusion': 'success'}]}
         if '/issues/7/comments' in path:
             return [{'body': '@codex review exact head prsha'}]
+        if path.endswith('/pulls/7/reviews?per_page=100'):
+            return [{'commit_id': 'prsha', 'state': self.review_state, 'user': {'login': 'reviewer'}}]
         if path == '/repos/mirrornode/example':
             return {'default_branch': 'main'}
         raise AssertionError(path)
 
 
 class RepoStewardTests(unittest.TestCase):
-    def test_checker_passes_bound_green_repo(self):
-        policy = {
+    @staticmethod
+    def policy():
+        return {
             'repositories': [{
                 'repository': 'mirrornode/example',
                 'enabled': True,
@@ -35,22 +41,37 @@ class RepoStewardTests(unittest.TestCase):
                 'required_workflows': ['PR Validation'],
             }]
         }
+
+    def run_checker(self, reader):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / 'policy.json'
-            path.write_text(json.dumps(policy), encoding='utf-8')
-            report = RepoChecker(path, reader=FakeReader()).check_all()
+            path.write_text(json.dumps(self.policy()), encoding='utf-8')
+            return RepoChecker(path, reader=reader).check_all()
+
+    def test_checker_passes_bound_green_approved_repo(self):
+        report = self.run_checker(FakeReader('APPROVED'))
         self.assertEqual(report['overall'], Verdict.PASS.value)
+
+    def test_nonapproving_review_does_not_clear_head(self):
+        report = self.run_checker(FakeReader('COMMENTED'))
+        self.assertEqual(report['overall'], Verdict.HOLD.value)
+
+    def test_changes_requested_fails_head(self):
+        report = self.run_checker(FakeReader('CHANGES_REQUESTED'))
+        self.assertEqual(report['overall'], Verdict.FAIL.value)
 
     def test_admin_execution_is_absent(self):
         admin = RepoAdmin()
         proposal = admin.propose('mirrornode/example', AdminAction.OPEN_PR, 'repair')
+        self.assertTrue(proposal.requires_operator_approval)
         with self.assertRaises(PermissionError):
             admin.execute(proposal)
 
-    def test_sensitive_actions_are_operator_gated(self):
+    def test_all_mutations_are_operator_gated(self):
         admin = RepoAdmin()
-        proposal = admin.propose('mirrornode/example', AdminAction.UPDATE_RULESET, 'tighten protection')
-        self.assertTrue(proposal.requires_operator_approval)
+        for action in AdminAction:
+            proposal = admin.propose('mirrornode/example', action, 'test')
+            self.assertTrue(proposal.requires_operator_approval)
 
 
 if __name__ == '__main__':
