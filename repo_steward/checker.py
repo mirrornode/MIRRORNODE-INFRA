@@ -73,7 +73,6 @@ class RepoChecker:
     def _check_exact_head_review(self, full_name: str, pr: dict[str, Any], sha: str) -> list[Finding]:
         number = pr["number"]
         findings: list[Finding] = []
-
         comments = self.reader.get(f"/repos/{full_name}/issues/{number}/comments?per_page=100")
         request_bound = any(
             sha in (comment.get("body") or "") and "review" in (comment.get("body") or "").lower()
@@ -85,44 +84,19 @@ class RepoChecker:
             f"PR #{number} {'has' if request_bound else 'does not have'} an observed review request naming its current head.",
             {"sha": sha},
         ))
-
         reviews = self.reader.get(f"/repos/{full_name}/pulls/{number}/reviews?per_page=100")
-        exact = [
-            review for review in reviews
-            if review.get("commit_id") == sha and str(review.get("state", "")).upper() != "PENDING"
-        ]
+        exact = [r for r in reviews if r.get("commit_id") == sha and str(r.get("state", "")).upper() != "PENDING"]
         if not exact:
-            findings.append(Finding(
-                "EXACT_HEAD_REVIEW_NOT_SUBMITTED",
-                Verdict.HOLD,
-                f"PR #{number} has no submitted review bound to its current head.",
-                {"sha": sha},
-            ))
+            findings.append(Finding("EXACT_HEAD_REVIEW_NOT_SUBMITTED", Verdict.HOLD, f"PR #{number} has no submitted review bound to its current head.", {"sha": sha}))
             return findings
-
-        states = {str(review.get("state", "")).upper() for review in exact}
-        reviewers = sorted({(review.get("user") or {}).get("login", "unknown") for review in exact})
+        states = {str(r.get("state", "")).upper() for r in exact}
+        reviewers = sorted({(r.get("user") or {}).get("login", "unknown") for r in exact})
         if "CHANGES_REQUESTED" in states:
-            findings.append(Finding(
-                "EXACT_HEAD_REVIEW_CHANGES_REQUESTED",
-                Verdict.FAIL,
-                f"PR #{number} has a current-head review requesting changes.",
-                {"sha": sha, "states": sorted(states), "reviewers": reviewers},
-            ))
+            findings.append(Finding("EXACT_HEAD_REVIEW_CHANGES_REQUESTED", Verdict.FAIL, f"PR #{number} has a current-head review requesting changes.", {"sha": sha, "states": sorted(states), "reviewers": reviewers}))
         elif "APPROVED" in states:
-            findings.append(Finding(
-                "EXACT_HEAD_REVIEW_APPROVED",
-                Verdict.PASS,
-                f"PR #{number} has an approving review bound to its current head.",
-                {"sha": sha, "states": sorted(states), "reviewers": reviewers},
-            ))
+            findings.append(Finding("EXACT_HEAD_REVIEW_APPROVED", Verdict.PASS, f"PR #{number} has an approving review bound to its current head.", {"sha": sha, "states": sorted(states), "reviewers": reviewers}))
         else:
-            findings.append(Finding(
-                "EXACT_HEAD_REVIEW_NONAPPROVING",
-                Verdict.HOLD,
-                f"PR #{number} has current-head review activity, but no machine-verifiable approving review. Manual/provider-specific disposition is required.",
-                {"sha": sha, "states": sorted(states), "reviewers": reviewers},
-            ))
+            findings.append(Finding("EXACT_HEAD_REVIEW_NONAPPROVING", Verdict.HOLD, f"PR #{number} has current-head review activity, but no machine-verifiable approving review. Manual/provider-specific disposition is required.", {"sha": sha, "states": sorted(states), "reviewers": reviewers}))
         return findings
 
     def check_repo(self, repo_cfg: dict[str, Any]) -> RepoReport:
@@ -141,13 +115,19 @@ class RepoChecker:
         else:
             findings.append(Finding("HEAD_BOUND", Verdict.PASS, "Default-branch head established.", {"sha": head_sha}))
 
+        if repo_cfg.get("require_protected_default_branch", False):
+            protected = branch.get("protected")
+            if protected is True:
+                findings.append(Finding("DEFAULT_BRANCH_PROTECTED", Verdict.PASS, f"Default branch `{default_branch}` is protected."))
+            elif protected is False:
+                findings.append(Finding("DEFAULT_BRANCH_UNPROTECTED", Verdict.FAIL, f"Default branch `{default_branch}` is not protected; direct platform bypass remains possible."))
+            else:
+                findings.append(Finding("DEFAULT_BRANCH_PROTECTION_UNKNOWN", Verdict.HOLD, f"Protection state for `{default_branch}` could not be verified."))
+
         workflows = self.reader.get(f"/repos/{full_name}/actions/workflows").get("workflows", [])
         names = {w.get("name") for w in workflows}
         for required in repo_cfg.get("required_workflows", []):
-            if required in names:
-                findings.append(Finding("WORKFLOW_PRESENT", Verdict.PASS, f"Required workflow present: {required}"))
-            else:
-                findings.append(Finding("WORKFLOW_MISSING", Verdict.FAIL, f"Required workflow missing: {required}"))
+            findings.append(Finding("WORKFLOW_PRESENT" if required in names else "WORKFLOW_MISSING", Verdict.PASS if required in names else Verdict.FAIL, f"Required workflow {'present' if required in names else 'missing'}: {required}"))
 
         prs = self.reader.get(f"/repos/{full_name}/pulls?state=open&per_page=100")
         for pr in prs:
@@ -166,7 +146,6 @@ class RepoChecker:
                 findings.append(Finding("PR_CI_ABSENT", Verdict.HOLD, f"PR #{pr['number']} has no observed pull-request workflow run on its current head.", {"sha": sha}))
             else:
                 findings.append(Finding("PR_CI_GREEN", Verdict.PASS, f"PR #{pr['number']} CI is green on current head.", {"sha": sha}))
-
             if repo_cfg.get("require_exact_head_review", False):
                 findings.extend(self._check_exact_head_review(full_name, pr, sha))
 
