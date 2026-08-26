@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -112,10 +112,21 @@ class RepoChecker:
         contributors: set[str] = set()
         for commit in commits:
             for field in ("author", "committer"):
-                login = str((commit.get(field) or {}).get("login") or "").lower()
-                if login:
-                    contributors.add(login)
+                user = commit.get(field)
+                login = str((user or {}).get("login") or "").lower()
+                if not isinstance(user, dict) or not login or str(user.get("type") or "") != "User":
+                    return None
+                contributors.add(login)
+            message = str(((commit.get("commit") or {}).get("message") or ""))
+            if any(line.lower().startswith("co-authored-by:") for line in message.splitlines()):
+                return None
         return contributors
+
+    def _approved_human_reviewer_ids(self) -> set[int]:
+        configured = self.policy.get("approved_human_reviewer_ids")
+        if not isinstance(configured, list):
+            return set()
+        return {value for value in configured if isinstance(value, int) and value > 0}
 
     def _is_independent_reviewer(
         self,
@@ -127,9 +138,10 @@ class RepoChecker:
         user = review.get("user") or {}
         login = str(user.get("login") or "").lower()
         author = str((pr.get("user") or {}).get("login") or "").lower()
+        reviewer_id = user.get("id")
         if not login or login == author or login in contributors:
             return False
-        if str(user.get("type") or "") != "User":
+        if str(user.get("type") or "") != "User" or reviewer_id not in self._approved_human_reviewer_ids():
             return False
         if login.endswith("[bot]") or login.endswith("-bot") or login in {"github-actions", "dependabot"}:
             return False
@@ -287,7 +299,30 @@ class RepoChecker:
         return failures, holds
 
     @staticmethod
-    def _ruleset_applies_to_branch(detail: dict[str, Any], branch: str) -> bool | None:
+    def _github_ref_pattern_matches(pattern: Any, ref: str) -> bool:
+        value = str(pattern)
+        if value == "~DEFAULT_BRANCH":
+            return True
+        expression: list[str] = []
+        index = 0
+        while index < len(value):
+            char = value[index]
+            if char == "*" and index + 1 < len(value) and value[index + 1] == "*":
+                expression.append(".*")
+                index += 2
+            elif char == "*":
+                expression.append("[^/]*")
+                index += 1
+            elif char == "?":
+                expression.append("[^/]")
+                index += 1
+            else:
+                expression.append(re.escape(char))
+                index += 1
+        return re.fullmatch("".join(expression), ref) is not None
+
+    @classmethod
+    def _ruleset_applies_to_branch(cls, detail: dict[str, Any], branch: str) -> bool | None:
         conditions = detail.get("conditions")
         if not isinstance(conditions, dict):
             return None
@@ -300,11 +335,10 @@ class RepoChecker:
             return None
         ref = f"refs/heads/{branch}"
 
-        def matches(pattern: Any) -> bool:
-            value = str(pattern)
-            return value == "~DEFAULT_BRANCH" or fnmatch.fnmatchcase(ref, value)
-
-        return any(matches(pattern) for pattern in includes) and not any(matches(pattern) for pattern in excludes)
+        return (
+            any(cls._github_ref_pattern_matches(pattern, ref) for pattern in includes)
+            and not any(cls._github_ref_pattern_matches(pattern, ref) for pattern in excludes)
+        )
 
     def _evaluate_rulesets(
         self,

@@ -27,8 +27,11 @@ class FakeReader:
         review_state="APPROVED",
         reviewer="reviewer",
         reviewer_type="User",
+        reviewer_id=42,
         reviewer_permission="write",
         pr_commit_author="author",
+        pr_commit_author_linked=True,
+        commit_message="",
         protected=True,
         inspectable=True,
         protection_overrides=None,
@@ -40,8 +43,11 @@ class FakeReader:
         self.review_state = review_state
         self.reviewer = reviewer
         self.reviewer_type = reviewer_type
+        self.reviewer_id = reviewer_id
         self.reviewer_permission = reviewer_permission
         self.pr_commit_author = pr_commit_author
+        self.pr_commit_author_linked = pr_commit_author_linked
+        self.commit_message = commit_message
         self.protected = protected
         self.inspectable = inspectable
         self.protection_overrides = protection_overrides or {}
@@ -65,10 +71,15 @@ class FakeReader:
             return [{
                 "commit_id": "prsha",
                 "state": self.review_state,
-                "user": {"login": self.reviewer, "type": self.reviewer_type},
+                "user": {"id": self.reviewer_id, "login": self.reviewer, "type": self.reviewer_type},
             }]
         if "/pulls/7/commits" in path:
-            return [{"author": {"login": self.pr_commit_author}, "committer": {"login": self.pr_commit_author}}]
+            contributor = {"login": self.pr_commit_author, "type": "User"}
+            return [{
+                "author": contributor if self.pr_commit_author_linked else None,
+                "committer": contributor,
+                "commit": {"message": self.commit_message},
+            }]
         if path == "/repos/mirrornode/example":
             return {"default_branch": "main"}
         raise AssertionError(path)
@@ -116,6 +127,7 @@ class RepoStewardTests(unittest.TestCase):
     @staticmethod
     def policy():
         return {
+            "approved_human_reviewer_ids": [42],
             "repositories": [{
                 "repository": "mirrornode/example",
                 "enabled": True,
@@ -194,11 +206,23 @@ class RepoStewardTests(unittest.TestCase):
     def test_bot_approval_does_not_clear_head(self):
         self.assertEqual(self.run_checker(FakeReader(reviewer="review-bot", reviewer_type="Bot"))["overall"], Verdict.HOLD.value)
 
+    def test_unrostered_user_approval_does_not_clear_head(self):
+        self.assertEqual(self.run_checker(FakeReader(reviewer_id=99))["overall"], Verdict.HOLD.value)
+
     def test_non_writer_approval_does_not_clear_head(self):
         self.assertEqual(self.run_checker(FakeReader(reviewer_permission="read"))["overall"], Verdict.HOLD.value)
 
     def test_repair_contributor_cannot_clear_head(self):
         self.assertEqual(self.run_checker(FakeReader(reviewer="repairer", pr_commit_author="repairer"))["overall"], Verdict.HOLD.value)
+
+    def test_unlinked_commit_attribution_does_not_clear_head(self):
+        self.assertEqual(self.run_checker(FakeReader(pr_commit_author_linked=False))["overall"], Verdict.HOLD.value)
+
+    def test_coauthored_commit_attribution_does_not_clear_head(self):
+        self.assertEqual(
+            self.run_checker(FakeReader(commit_message="Subject\n\nCo-authored-by: Extra <extra@example.test>"))["overall"],
+            Verdict.HOLD.value,
+        )
 
     def test_unauthenticated_review_request_does_not_clear_request_gate(self):
         self.assertEqual(self.run_checker(FakeReader(request_association="NONE"))["overall"], Verdict.HOLD.value)
@@ -233,6 +257,10 @@ class RepoStewardTests(unittest.TestCase):
             ruleset_details={"1": detail},
         ))
         self.assertEqual(report["overall"], Verdict.FAIL.value)
+
+    def test_ruleset_glob_does_not_cross_path_separator(self):
+        self.assertFalse(RepoChecker._github_ref_pattern_matches("refs/heads/*", "refs/heads/release/1"))
+        self.assertTrue(RepoChecker._github_ref_pattern_matches("refs/heads/**", "refs/heads/release/1"))
 
     def test_admin_execution_is_absent(self):
         admin = RepoAdmin()
