@@ -19,7 +19,7 @@ def main() -> int:
         print(rendered)
     else:
         Path(args.output).write_text(rendered + "\n", encoding="utf-8")
-    return 1 if report["overall"] == "FAIL" else 0
+    return 0 if report["overall"] == "PASS" else 1
 
 
 if __name__ == "__main__":
