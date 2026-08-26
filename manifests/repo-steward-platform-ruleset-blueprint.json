@@ -23,7 +23,14 @@
     "minimum_advisory_attestations": 1,
     "approved_lanes": ["OPENAI_ASSISTANT", "PERPLEXITY", "CLAUDE"],
     "required_check_name": "Repo Steward Dual Control",
-    "note": "The advisory attestation is a second witness/review control, not delegated merge authority. The GitHub ruleset must not include an actor capable of bypassing required pull request and status-check rules for ordinary operation."
+    "trusted_producer": {
+      "type": "GITHUB_APP",
+      "binding_required": true,
+      "app_id": null,
+      "slug": null,
+      "state": "UNBOUND_FAIL_CLOSED"
+    },
+    "note": "The required check is not eligible for live enforcement until its exact trusted GitHub App/integration identity is recorded. A context name alone is insufficient. Until producer identity is bound, Repo Steward Dual Control must be treated as unavailable and the rollout remains HOLD."
   },
   "deployment_order": [
     "MIRRORNODE-CORE-HUB",
