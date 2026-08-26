@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import urllib.error
@@ -72,7 +73,14 @@ class GitHubReader:
 
 class RepoChecker:
     def __init__(self, policy_path: str | Path = "manifests/repo-steward-policy.json", reader: GitHubReader | None = None) -> None:
-        self.policy = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+        self.policy_path = Path(policy_path)
+        self.policy = json.loads(self.policy_path.read_text(encoding="utf-8"))
+        blueprint_path = self.policy_path.parent / "repo-steward-platform-ruleset-blueprint.json"
+        self.ruleset_blueprint = (
+            json.loads(blueprint_path.read_text(encoding="utf-8"))
+            if blueprint_path.is_file()
+            else None
+        )
         self.reader = reader or GitHubReader()
 
     @staticmethod
@@ -96,15 +104,39 @@ class RepoChecker:
             if page > 100:
                 raise RuntimeError(f"github pagination exceeded safety bound: {path}")
 
-    @staticmethod
-    def _is_independent_reviewer(review: dict[str, Any], pr: dict[str, Any]) -> bool:
-        login = str((review.get("user") or {}).get("login") or "").lower()
+    def _review_contributor_logins(self, full_name: str, pr_number: int) -> set[str] | None:
+        try:
+            commits = self._get_paginated(f"/repos/{full_name}/pulls/{pr_number}/commits")
+        except RuntimeError:
+            return None
+        contributors: set[str] = set()
+        for commit in commits:
+            for field in ("author", "committer"):
+                login = str((commit.get(field) or {}).get("login") or "").lower()
+                if login:
+                    contributors.add(login)
+        return contributors
+
+    def _is_independent_reviewer(
+        self,
+        full_name: str,
+        review: dict[str, Any],
+        pr: dict[str, Any],
+        contributors: set[str],
+    ) -> bool:
+        user = review.get("user") or {}
+        login = str(user.get("login") or "").lower()
         author = str((pr.get("user") or {}).get("login") or "").lower()
-        if not login or login == author:
+        if not login or login == author or login in contributors:
+            return False
+        if str(user.get("type") or "") != "User":
             return False
         if login.endswith("[bot]") or login.endswith("-bot") or login in {"github-actions", "dependabot"}:
             return False
-        return True
+        permission, status = self.reader.get_optional(f"/repos/{full_name}/collaborators/{login}/permission")
+        if status != 200 or not isinstance(permission, dict):
+            return False
+        return str(permission.get("permission") or "").lower() in {"admin", "maintain", "write"}
 
     def _check_exact_head_review(self, full_name: str, pr: dict[str, Any], sha: str) -> list[Finding]:
         number = pr["number"]
@@ -136,7 +168,22 @@ class RepoChecker:
             findings.append(Finding("EXACT_HEAD_REVIEW_CHANGES_REQUESTED", Verdict.FAIL, f"PR #{number} has a current-head review requesting changes.", {"sha": sha, "states": sorted(states), "reviewers": reviewers}))
             return findings
 
-        independent_approvals = [r for r in exact if str(r.get("state", "")).upper() == "APPROVED" and self._is_independent_reviewer(r, pr)]
+        contributors = self._review_contributor_logins(full_name, number)
+        if contributors is None:
+            findings.append(Finding(
+                "EXACT_HEAD_REVIEW_CONTRIBUTOR_BINDING_UNOBSERVABLE",
+                Verdict.HOLD,
+                f"PR #{number} review contributors could not be bound, so reviewer independence cannot be established.",
+                {"sha": sha},
+            ))
+            return findings
+
+        independent_approvals = [
+            r
+            for r in exact
+            if str(r.get("state", "")).upper() == "APPROVED"
+            and self._is_independent_reviewer(full_name, r, pr, contributors)
+        ]
         if independent_approvals:
             findings.append(Finding("EXACT_HEAD_REVIEW_APPROVED", Verdict.PASS, f"PR #{number} has an independent approving review bound to its current head.", {"sha": sha, "reviewers": sorted({(r.get('user') or {}).get('login', 'unknown') for r in independent_approvals})}))
         elif "APPROVED" in states:
@@ -156,7 +203,36 @@ class RepoChecker:
                 names.add(str(item["context"]))
         return names
 
-    def _evaluate_classic_protection(self, protection: dict[str, Any], required_checks: set[str]) -> tuple[list[str], list[str]]:
+    def _trusted_check_producers(self) -> tuple[dict[str, int] | None, str | None]:
+        if not isinstance(self.ruleset_blueprint, dict):
+            return None, "Repo Steward ruleset blueprint is unavailable."
+        dual_control = self.ruleset_blueprint.get("dual_control")
+        if not isinstance(dual_control, dict):
+            return None, "Repo Steward dual-control configuration is unavailable."
+        check_name = dual_control.get("required_check_name")
+        producer = dual_control.get("trusted_producer")
+        if not isinstance(check_name, str) or not check_name or not isinstance(producer, dict):
+            return None, "Repo Steward trusted-producer configuration is incomplete."
+        if producer.get("binding_required") is not True or producer.get("state") != "BOUND":
+            return None, "Repo Steward trusted producer remains unbound; platform protection cannot be certified."
+        if producer.get("type") != "GITHUB_APP" or not isinstance(producer.get("app_id"), int) or producer["app_id"] <= 0:
+            return None, "Repo Steward trusted GitHub App identity is invalid."
+        return {check_name: producer["app_id"]}, None
+
+    @staticmethod
+    def _producer_bound(entries: list[dict[str, Any]], check_name: str, app_id: int, field: str) -> bool:
+        return any(
+            str(entry.get("context") or "") == check_name and entry.get(field) == app_id
+            for entry in entries
+            if isinstance(entry, dict)
+        )
+
+    def _evaluate_classic_protection(
+        self,
+        protection: dict[str, Any],
+        required_checks: set[str],
+        trusted_producers: dict[str, int],
+    ) -> tuple[list[str], list[str]]:
         failures: list[str] = []
         holds: list[str] = []
         pr = protection.get("required_pull_request_reviews")
@@ -183,6 +259,10 @@ class RepoChecker:
             missing = sorted(required_checks - observed)
             if missing:
                 failures.append(f"required check identities are not enforced: {missing}")
+            entries = [item for item in checks.get("checks", []) or [] if isinstance(item, dict)]
+            for name, app_id in trusted_producers.items():
+                if not self._producer_bound(entries, name, app_id, "app_id"):
+                    failures.append(f"trusted producer binding is not enforced for required check: {name}")
 
         conversations = protection.get("required_conversation_resolution")
         if not isinstance(conversations, dict) or conversations.get("enabled") is not True:
@@ -206,7 +286,33 @@ class RepoChecker:
             failures.append("named push actors are configured")
         return failures, holds
 
-    def _evaluate_rulesets(self, full_name: str, required_checks: set[str]) -> tuple[list[str], list[str]]:
+    @staticmethod
+    def _ruleset_applies_to_branch(detail: dict[str, Any], branch: str) -> bool | None:
+        conditions = detail.get("conditions")
+        if not isinstance(conditions, dict):
+            return None
+        ref_name = conditions.get("ref_name")
+        if not isinstance(ref_name, dict):
+            return None
+        includes = ref_name.get("include")
+        excludes = ref_name.get("exclude")
+        if not isinstance(includes, list) or not isinstance(excludes, list):
+            return None
+        ref = f"refs/heads/{branch}"
+
+        def matches(pattern: Any) -> bool:
+            value = str(pattern)
+            return value == "~DEFAULT_BRANCH" or fnmatch.fnmatchcase(ref, value)
+
+        return any(matches(pattern) for pattern in includes) and not any(matches(pattern) for pattern in excludes)
+
+    def _evaluate_rulesets(
+        self,
+        full_name: str,
+        default_branch: str,
+        required_checks: set[str],
+        trusted_producers: dict[str, int],
+    ) -> tuple[list[str], list[str]]:
         summaries, status = self.reader.get_optional(f"/repos/{full_name}/rulesets")
         if status != 200 or not isinstance(summaries, list):
             return [], ["applicable rulesets are not observable"]
@@ -214,15 +320,31 @@ class RepoChecker:
         if not active:
             return ["no active branch ruleset is observable"], []
 
-        combined_types: set[str] = set()
-        check_names: set[str] = set()
-        pr_ok = False
+        applicable: list[dict[str, Any]] = []
+        holds: list[str] = []
         for summary in active:
             detail, detail_status = self.reader.get_optional(f"/repos/{full_name}/rulesets/{summary.get('id')}")
             if detail_status != 200 or not isinstance(detail, dict):
+                holds.append(f"active ruleset {summary.get('id')} could not be inspected")
                 continue
+            applies = self._ruleset_applies_to_branch(detail, default_branch)
+            if applies is None:
+                holds.append(f"active ruleset {summary.get('id')} has unobservable branch applicability")
+            elif applies:
+                applicable.append(detail)
+
+        if not applicable:
+            return [f"no active branch ruleset is explicitly applicable to {default_branch}"], holds
+
+        combined_types: set[str] = set()
+        check_names: set[str] = set()
+        check_entries: list[dict[str, Any]] = []
+        pr_ok = False
+        failures: list[str] = []
+        for detail in applicable:
             if detail.get("bypass_actors"):
-                return ["active ruleset contains bypass actors"], []
+                failures.append("active applicable ruleset contains bypass actors")
+                continue
             for rule in detail.get("rules", []) or []:
                 if not isinstance(rule, dict):
                     continue
@@ -230,18 +352,17 @@ class RepoChecker:
                 combined_types.add(rule_type)
                 params = rule.get("parameters") or {}
                 if rule_type == "pull_request":
-                    pr_ok = (
+                    pr_ok = pr_ok or (
                         int(params.get("required_approving_review_count") or 0) >= 1
                         and params.get("dismiss_stale_reviews_on_push") is True
                         and params.get("require_last_push_approval") is True
                         and params.get("required_review_thread_resolution") is True
                     )
-                elif rule_type == "required_status_checks":
-                    if params.get("strict_required_status_checks_policy") is True:
-                        check_names.update(str(x.get("context")) for x in params.get("required_status_checks", []) or [] if isinstance(x, dict) and x.get("context"))
+                elif rule_type == "required_status_checks" and params.get("strict_required_status_checks_policy") is True:
+                    entries = [x for x in params.get("required_status_checks", []) or [] if isinstance(x, dict)]
+                    check_entries.extend(entries)
+                    check_names.update(str(x.get("context")) for x in entries if x.get("context"))
 
-        failures: list[str] = []
-        holds: list[str] = []
         if "deletion" not in combined_types:
             failures.append("ruleset does not block deletion")
         if "non_fast_forward" not in combined_types:
@@ -251,6 +372,9 @@ class RepoChecker:
         missing = sorted(required_checks - check_names)
         if missing:
             failures.append(f"ruleset required check identities are not enforced: {missing}")
+        for name, app_id in trusted_producers.items():
+            if not self._producer_bound(check_entries, name, app_id, "integration_id"):
+                failures.append(f"ruleset trusted producer binding is not enforced for required check: {name}")
         return failures, holds
 
     def _check_platform_protection(self, full_name: str, default_branch: str, branch: dict[str, Any], required_checks: set[str]) -> list[Finding]:
@@ -259,11 +383,21 @@ class RepoChecker:
         if branch.get("protected") is not True:
             return [Finding("PLATFORM_PROTECTION_HOLD", Verdict.HOLD, f"Protection state for `{default_branch}` could not be verified.")]
 
+        trusted_producers, producer_error = self._trusted_check_producers()
+        if producer_error or trusted_producers is None:
+            return [Finding(
+                "PLATFORM_PROTECTION_HOLD",
+                Verdict.HOLD,
+                f"Default branch {default_branch} protection cannot be certified until the Repo Steward trusted producer is bound.",
+                {"reason": producer_error},
+            )]
+        required_checks = required_checks | set(trusted_producers)
+
         protection, status = self.reader.get_optional(f"/repos/{full_name}/branches/{default_branch}/protection")
         if status == 200 and isinstance(protection, dict):
-            failures, holds = self._evaluate_classic_protection(protection, required_checks)
+            failures, holds = self._evaluate_classic_protection(protection, required_checks, trusted_producers)
         else:
-            failures, holds = self._evaluate_rulesets(full_name, required_checks)
+            failures, holds = self._evaluate_rulesets(full_name, default_branch, required_checks, trusted_producers)
 
         if failures:
             return [Finding("PLATFORM_PROTECTION_FAIL", Verdict.FAIL, f"`{default_branch}` protection contradicts required policy.", {"failures": failures, "holds": holds})]
