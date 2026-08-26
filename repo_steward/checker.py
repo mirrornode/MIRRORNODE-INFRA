@@ -303,23 +303,44 @@ class RepoChecker:
         value = str(pattern)
         if value == "~DEFAULT_BRANCH":
             return True
-        expression: list[str] = []
-        index = 0
-        while index < len(value):
-            char = value[index]
-            if char == "*" and index + 1 < len(value) and value[index + 1] == "*":
-                expression.append(".*")
-                index += 2
-            elif char == "*":
-                expression.append("[^/]*")
+        pattern_parts = value.split("/")
+        ref_parts = ref.split("/")
+
+        def segment_matches(segment_pattern: str, segment: str) -> bool:
+            expression: list[str] = []
+            index = 0
+            while index < len(segment_pattern):
+                char = segment_pattern[index]
+                if char == "*":
+                    # In a segment, both * and a terminal ** are pathname-bound.
+                    while index + 1 < len(segment_pattern) and segment_pattern[index + 1] == "*":
+                        index += 1
+                    expression.append(".*")
+                elif char == "?":
+                    expression.append(".")
+                else:
+                    expression.append(re.escape(char))
                 index += 1
-            elif char == "?":
-                expression.append("[^/]")
-                index += 1
-            else:
-                expression.append(re.escape(char))
-                index += 1
-        return re.fullmatch("".join(expression), ref) is not None
+            return re.fullmatch("".join(expression), segment) is not None
+
+        def matches(pattern_index: int, ref_index: int) -> bool:
+            if pattern_index == len(pattern_parts):
+                return ref_index == len(ref_parts)
+            part = pattern_parts[pattern_index]
+            # GitHub's File.fnmatch(..., FNM_PATHNAME) behavior gives ** its
+            # recursive meaning only when it is followed by another path part.
+            # That form may consume zero or more complete directory components.
+            if part == "**" and pattern_index + 1 < len(pattern_parts):
+                return matches(pattern_index + 1, ref_index) or (
+                    ref_index < len(ref_parts) and matches(pattern_index, ref_index + 1)
+                )
+            return (
+                ref_index < len(ref_parts)
+                and segment_matches(part, ref_parts[ref_index])
+                and matches(pattern_index + 1, ref_index + 1)
+            )
+
+        return matches(0, 0)
 
     @classmethod
     def _ruleset_applies_to_branch(cls, detail: dict[str, Any], branch: str) -> bool | None:

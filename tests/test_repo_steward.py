@@ -260,7 +260,11 @@ class RepoStewardTests(unittest.TestCase):
 
     def test_ruleset_glob_does_not_cross_path_separator(self):
         self.assertFalse(RepoChecker._github_ref_pattern_matches("refs/heads/*", "refs/heads/release/1"))
-        self.assertTrue(RepoChecker._github_ref_pattern_matches("refs/heads/**", "refs/heads/release/1"))
+        self.assertFalse(RepoChecker._github_ref_pattern_matches("refs/heads/**", "refs/heads/release/1"))
+
+    def test_ruleset_globstar_may_match_zero_directory_components(self):
+        self.assertTrue(RepoChecker._github_ref_pattern_matches("refs/heads/**/main", "refs/heads/main"))
+        self.assertTrue(RepoChecker._github_ref_pattern_matches("refs/heads/**/main", "refs/heads/release/main"))
 
     def test_admin_execution_is_absent(self):
         admin = RepoAdmin()
