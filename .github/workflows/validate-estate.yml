@@ -24,5 +24,8 @@ jobs:
       - name: Validate estate manifest
         run: python scripts/validate_estate.py
 
+      - name: Validate main-protection manifest
+        run: python scripts/estate_protection.py --validate-manifest-only
+
       - name: Test estate protection tooling
         run: python scripts/test_estate_protection.py
