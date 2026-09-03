@@ -234,6 +234,35 @@ def test_manifest_is_loaded_and_semantically_validated():
     assert mod.validate_manifest(bad)
 
 
+
+def test_read_only_snapshot_binds_head_reviews_and_latest_runs():
+    originals = (mod.request, mod.paginate, mod.effective_default_branch_protection)
+    def fake_request(token, method, url, payload=None, allow_404=False):
+        if "/pulls/7" in url:
+            return {"head": {"sha": "head"}, "user": {"login": "author"}}
+        if "/actions/runs?" in url:
+            return {"workflow_runs": [{"id": 33, "name": "CI", "run_attempt": 2, "status": "completed", "conclusion": "success", "head_sha": "head"}]}
+        raise AssertionError(url)
+    def fake_paginate(token, url):
+        if url.endswith("/reviews"):
+            return [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
+        if url.endswith("/commits"):
+            return [{"author": {"login": "pusher"}}]
+        raise AssertionError(url)
+    mod.request = fake_request
+    mod.paginate = fake_paginate
+    mod.effective_default_branch_protection = lambda token, repo: surface()
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        assert snap["status"] == "PASS"
+        assert snap["observed_head_sha"] == "head"
+        assert snap["evidence"]["review_ids"] == [22]
+        assert snap["evidence"]["workflow_runs"][0]["id"] == 33
+        assert snap["completeness"]["dependencies_security"] == "not_collected"
+    finally:
+        mod.request, mod.paginate, mod.effective_default_branch_protection = originals
+
+
 def run_all():
     tests = [(name, value) for name, value in globals().items() if name.startswith("test_") and callable(value)]
     for name, test in sorted(tests):

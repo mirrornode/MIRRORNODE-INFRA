@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 API = "https://api.github.com"
@@ -387,11 +389,79 @@ def latest_run_status(token: str, repo: str, sha: str, required_workflows: list[
     return evaluate_latest_runs(runs, required_workflows)
 
 
+
+def _operator_debt(code: str, subject: str, detail: str, evidence: list[dict]) -> dict:
+    return {
+        "id": "github-ops:" + subject + ":" + code,
+        "code": code,
+        "subject": subject,
+        "severity": "blocking",
+        "detail": detail,
+        "evidence": evidence,
+        "resolution": "collect fresh complete evidence satisfying the named gate",
+    }
+
+
+def build_read_only_snapshot(token: str, repo: str, pr_number: int, expected_sha: str, required_workflows: list[str], manifest: dict) -> dict:
+    """Collect one immutable-input, read-only GitHub Ops projection."""
+    collected_at = datetime.now(timezone.utc).isoformat()
+    policy_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    policy_sha256 = hashlib.sha256(policy_bytes).hexdigest()
+    pr = request(token, "GET", API + "/repos/" + repo + "/pulls/" + str(pr_number))
+    reviews = paginate(token, API + "/repos/" + repo + "/pulls/" + str(pr_number) + "/reviews")
+    commits = paginate(token, API + "/repos/" + repo + "/pulls/" + str(pr_number) + "/commits")
+    runs_payload = request(token, "GET", API + "/repos/" + repo + "/actions/runs?head_sha=" + expected_sha + "&event=pull_request&per_page=100")
+    runs = (runs_payload or {}).get("workflow_runs") or []
+    protection = effective_default_branch_protection(token, repo)
+    approval_ok, approval_errors = evaluate_exact_head_approval(pr, reviews, commits, expected_sha)
+    workflow_ok, workflow_errors = evaluate_latest_runs(runs, required_workflows)
+    protection_ok, protection_errors = validate_effective_protection(protection, manifest)
+    evidence = {
+        "head_sha": ((pr.get("head") or {}).get("sha")),
+        "review_ids": [r.get("id") for r in reviews if r.get("id") is not None],
+        "workflow_runs": [
+            {"id": r.get("id"), "name": r.get("name"), "run_attempt": r.get("run_attempt"), "status": r.get("status"), "conclusion": r.get("conclusion"), "head_sha": r.get("head_sha")}
+            for r in runs
+        ],
+    }
+    debt: list[dict] = []
+    if not protection_ok:
+        debt.append(_operator_debt("protection-hold", repo, "; ".join(protection_errors), [{"kind": "protection", "repository": repo}]))
+    if not approval_ok:
+        debt.append(_operator_debt("exact-head-review-hold", repo + "#" + str(pr_number), "; ".join(approval_errors), [{"kind": "pull_request", "number": pr_number, "head_sha": evidence["head_sha"]}]))
+    if not workflow_ok:
+        debt.append(_operator_debt("workflow-hold", expected_sha, "; ".join(workflow_errors), [{"kind": "workflow_run", **item} for item in evidence["workflow_runs"]]))
+    return {
+        "schema_version": "github-ops.snapshot.v0.1",
+        "repository": repo,
+        "pull_request": pr_number,
+        "expected_head_sha": expected_sha,
+        "observed_head_sha": evidence["head_sha"],
+        "observed_at": collected_at,
+        "collector": {"mode": "read-only", "credential_source": "environment"},
+        "policy": {"version": manifest.get("version"), "sha256": policy_sha256},
+        "completeness": {
+            "protection": "complete" if protection.get("complete") else "partial",
+            "reviews": "complete",
+            "workflows": "complete" if len(runs) < 100 else "partial",
+            "dependencies_security": "not_collected",
+        },
+        "evidence": evidence,
+        "operator_debt": debt,
+        "status": "PASS" if not debt else "HOLD",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
     parser.add_argument("--apply", action="store_true", help="monotonically strengthen the named ruleset")
     parser.add_argument("--validate-manifest-only", action="store_true")
+    parser.add_argument("--snapshot-json", action="store_true", help="emit a read-only GitHub Ops snapshot")
+    parser.add_argument("--repo")
+    parser.add_argument("--pr-number", type=int)
+    parser.add_argument("--expected-sha")
+    parser.add_argument("--required-workflow", action="append", default=[])
     args = parser.parse_args()
 
     try:
@@ -413,6 +483,21 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    if args.snapshot_json:
+        if not args.repo or not args.pr_number or not args.expected_sha or not args.required_workflow:
+            print("ERROR: --snapshot-json requires --repo, --pr-number, --expected-sha, and --required-workflow", file=sys.stderr)
+            return 2
+        if args.repo not in manifest["repositories"]:
+            print("ERROR: snapshot repository is outside the manifest", file=sys.stderr)
+            return 2
+        try:
+            snapshot = build_read_only_snapshot(token, args.repo, args.pr_number, args.expected_sha, args.required_workflow, manifest)
+        except Exception as exc:
+            print(json.dumps({"schema_version": "github-ops.snapshot.v0.1", "status": "HOLD", "error": str(exc)}, sort_keys=True))
+            return 1
+        print(json.dumps(snapshot, sort_keys=True))
+        return 0 if snapshot["status"] == "PASS" else 1
 
     failed = False
     for repo in manifest["repositories"]:
