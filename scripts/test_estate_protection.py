@@ -95,9 +95,9 @@ def test_paginates_ruleset_discovery():
     calls = []
     def fake(token, method, url, payload=None, allow_404=False):
         calls.append(url)
-        if "page=1" in url:
+        if "&page=1" in url:
             return [{"id": i} for i in range(100)]
-        if "page=2" in url:
+        if "&page=2" in url:
             return [{"id": 101}]
         raise AssertionError(url)
     mod.request = fake
