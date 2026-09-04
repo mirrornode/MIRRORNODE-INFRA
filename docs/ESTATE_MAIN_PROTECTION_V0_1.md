@@ -47,7 +47,9 @@ Apply and verify:
 GH_TOKEN=... python3 scripts/estate_protection.py --apply
 ```
 
-The token must have repository administration permission for every target repository. The tool discovers the named ruleset, preserves all non-PR rules, strengthens only the `pull_request` parameters, then re-reads the ruleset and verifies the desired state. If the named ruleset is absent, it creates the minimal baseline declared by the manifest.
+The token must have repository administration permission for every target repository. The tool first evaluates the complete readable effective default-branch protection surface, including applicable active rulesets and relevant classic branch protection. When `--apply` is explicitly authorized, it discovers the named baseline ruleset, preserves its non-PR rules, and monotonically strengthens only the `pull_request` parameters. If the named ruleset is absent, it may create the minimal baseline declared by the manifest. After any write, it re-reads the complete effective protection surface and verifies the manifest invariants fail-closed.
+
+`required_status_checks.mode = preserve_existing_nonempty` does not authorize the tool to invent a required-check identity. If no effective required status check is readable, audit remains HOLD and `--apply` does not manufacture one.
 
 ## Failure semantics
 
