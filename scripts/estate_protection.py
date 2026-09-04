@@ -368,12 +368,32 @@ def _required_check_identity(context: str, *, producer_kind: str, producer_id, s
     }
 
 
+def _record_strict_required_status_checks_policy(
+    aggregate: dict,
+    parameters: dict,
+    field: str,
+    source: str,
+) -> None:
+    if field not in parameters:
+        return
+    value = parameters.get(field)
+    receipt = {
+        "source": source,
+        "value": value if isinstance(value, bool) else None,
+        "available": isinstance(value, bool),
+    }
+    aggregate["strict_required_status_checks_policy"]["sources"].append(receipt)
+    if value is True:
+        aggregate["strict_required_status_checks_policy"]["required"] = True
+
+
 def _aggregate_effective(surface: dict) -> dict:
     aggregate = {
         "rule_types": set(),
         "review": {},
         "status_checks": [],
         "bypass_actors": [],
+        "strict_required_status_checks_policy": {"required": False, "sources": []},
     }
     repo_info = surface.get("repository") or {}
     repo_methods = []
@@ -398,6 +418,12 @@ def _aggregate_effective(surface: dict) -> dict:
                     {k: v for k, v in params.items() if k in ALLOWED_REVIEW_KEYS},
                 )
             elif rtype == "required_status_checks":
+                _record_strict_required_status_checks_policy(
+                    aggregate,
+                    params,
+                    "strict_required_status_checks_policy",
+                    f"ruleset:{ruleset_id}:required_status_checks.strict_required_status_checks_policy",
+                )
                 for check in params.get("required_status_checks") or []:
                     context = check.get("context")
                     if context:
@@ -453,6 +479,13 @@ def _aggregate_effective(surface: dict) -> dict:
                     }
                 )
         checks = classic.get("required_status_checks") or {}
+        if checks:
+            _record_strict_required_status_checks_policy(
+                aggregate,
+                checks,
+                "strict",
+                "classic_branch_protection.required_status_checks.strict",
+            )
         for check in checks.get("checks") or []:
             context = check.get("context")
             if context:
@@ -701,7 +734,9 @@ def read_review_gate_state(token: str, repo: str, pr_number: int) -> dict:
 
 def read_latest_push_evidence(token: str, repo: str, pr: dict, expected_sha: str) -> dict:
     head = pr.get("head") or {}
-    head_repo = ((head.get("repo") or {}).get("full_name") or repo)
+    head_repo = ((head.get("repo") or {}).get("full_name"))
+    if not head_repo:
+        raise RuntimeError("PR head repository unavailable for push provenance")
     head_ref = head.get("ref")
     if not head_ref:
         raise RuntimeError("PR head ref unavailable for push provenance")
@@ -774,6 +809,50 @@ def _workflow_run_matches_required(workflow_run: dict, required_workflows: list[
     return any(str(required) in identifiers for required in required_workflows)
 
 
+def _trusted_workflow_selector(required_workflow: str) -> dict | None:
+    raw = str(required_workflow or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("path:"):
+        path = raw[len("path:"):].strip()
+        return {"kind": "path", "value": path, "raw": raw} if path else None
+    if raw.startswith("id:"):
+        workflow_id = raw[len("id:"):].strip()
+        return {"kind": "id", "value": workflow_id, "raw": raw} if workflow_id.isdigit() else None
+    if raw.startswith(".github/workflows/"):
+        return {"kind": "path", "value": raw, "raw": raw}
+    if raw.isdigit():
+        return {"kind": "id", "value": raw, "raw": raw}
+    return None
+
+
+def _trusted_workflow_selectors(required_workflows: list[str]) -> tuple[list[dict], list[str]]:
+    selectors: list[dict] = []
+    errors: list[str] = []
+    if not required_workflows:
+        errors.append("trusted workflow identity unavailable: no required workflow path or id supplied")
+        return selectors, errors
+    for required in required_workflows:
+        selector = _trusted_workflow_selector(required)
+        if selector is None:
+            errors.append(f"trusted workflow identity unavailable: {required}")
+        else:
+            selectors.append(selector)
+    return selectors, errors
+
+
+def _workflow_run_matches_trusted_selector(workflow_run: dict, selector: dict) -> bool:
+    if selector.get("kind") == "path":
+        return str(workflow_run.get("path") or "") == selector.get("value")
+    if selector.get("kind") == "id":
+        return str(workflow_run.get("workflow_id") or "") == selector.get("value")
+    return False
+
+
+def _workflow_run_matches_trusted_requirement(workflow_run: dict, selectors: list[dict]) -> bool:
+    return any(_workflow_run_matches_trusted_selector(workflow_run, selector) for selector in selectors)
+
+
 def _github_actions_identity(app: dict) -> bool | None:
     if not isinstance(app, dict):
         return None
@@ -805,6 +884,12 @@ def _resolve_workflow_for_check_run(
     required_workflows: list[str],
 ) -> tuple[dict | None, str | None]:
     context = check_run.get("name")
+    selectors, selector_errors = _trusted_workflow_selectors(required_workflows)
+    if selector_errors:
+        return None, (
+            f"workflow provenance unavailable for required check: {context}; "
+            + "; ".join(selector_errors)
+        )
     suite_id = _check_suite_id(check_run)
     if suite_id is None:
         return None, f"check suite provenance unavailable for required check: {context}"
@@ -813,7 +898,7 @@ def _resolve_workflow_for_check_run(
         if run.get("check_suite_id") == suite_id
         and run.get("head_sha") == expected_sha
         and run.get("event") == "pull_request"
-        and _workflow_run_matches_required(run, required_workflows)
+        and _workflow_run_matches_trusted_requirement(run, selectors)
     ]
     if not candidates:
         return None, f"workflow provenance unavailable for required check: {context}"
@@ -980,8 +1065,24 @@ def evaluate_latest_runs(
     expected_sha: str | None = None,
 ) -> tuple[bool, list[str]]:
     errors: list[str] = []
-    for name in required_workflows:
-        candidates = [r for r in runs if r.get("name") == name]
+    if expected_sha is None:
+        requirements = [{"raw": name, "candidates": [r for r in runs if r.get("name") == name]} for name in required_workflows]
+    else:
+        selectors, selector_errors = _trusted_workflow_selectors(required_workflows)
+        errors.extend(selector_errors)
+        requirements = [
+            {
+                "raw": selector["raw"],
+                "candidates": [
+                    r for r in runs
+                    if _workflow_run_matches_trusted_selector(r, selector)
+                ],
+            }
+            for selector in selectors
+        ]
+    for requirement in requirements:
+        name = requirement["raw"]
+        candidates = requirement["candidates"]
         if not candidates:
             errors.append(f"required workflow missing: {name}")
             continue
@@ -1024,6 +1125,65 @@ def latest_run_status(token: str, repo: str, sha: str, required_workflows: list[
     runs = paginate_object_items(token, f"{API}/repos/{repo}/actions/runs?head_sha={sha}&event=pull_request", "workflow_runs")
     return evaluate_latest_runs(runs, required_workflows, sha)
 
+
+def _pr_base_binding(pr: dict) -> dict:
+    base = pr.get("base") or {}
+    return {
+        "repository": ((base.get("repo") or {}).get("full_name") or ""),
+        "ref": base.get("ref"),
+        "sha": base.get("sha"),
+    }
+
+
+def _repo_key(repository: str | None) -> str:
+    return str(repository or "").lower()
+
+
+def _base_identity(base: dict) -> tuple[str, str | None]:
+    return (_repo_key(base.get("repository")), base.get("ref"))
+
+
+def _compare_endpoint(repo: str, base_sha: str | None, expected_sha: str) -> str | None:
+    if not base_sha:
+        return None
+    return (
+        f"{API}/repos/{repo}/compare/"
+        f"{quote(str(base_sha), safe='')}...{quote(str(expected_sha), safe='')}"
+    )
+
+
+def _strict_sync_evidence_template(repo: str, base: dict, expected_sha: str, *, required: bool) -> dict:
+    return {
+        "required": required,
+        "availability": "not_required" if not required else "unavailable",
+        "repository": repo,
+        "base_repository": base.get("repository"),
+        "base_ref": base.get("ref"),
+        "base_sha": base.get("sha"),
+        "expected_head_sha": expected_sha,
+        "behind_by": None,
+        "source_endpoint": _compare_endpoint(repo, base.get("sha"), expected_sha),
+    }
+
+
+def read_strict_required_check_synchronization(token: str, repo: str, base: dict, expected_sha: str) -> dict:
+    evidence = _strict_sync_evidence_template(repo, base, expected_sha, required=True)
+    base_sha = base.get("sha")
+    if not base_sha:
+        raise RuntimeError("PR base sha unavailable for strict required-check synchronization")
+    endpoint = evidence["source_endpoint"]
+    payload = request(token, "GET", endpoint)
+    if not isinstance(payload, dict) or not isinstance(payload.get("behind_by"), int):
+        raise RuntimeError("strict required-check synchronization comparison malformed")
+    evidence.update(
+        {
+            "availability": "observed",
+            "behind_by": payload.get("behind_by"),
+        }
+    )
+    return evidence
+
+
 def _operator_debt(code: str, subject: str, detail: str, evidence: list[dict]) -> dict:
     return {
         "id": "github-ops:" + subject + ":" + code,
@@ -1054,6 +1214,7 @@ def build_read_only_snapshot(
     governed_repo_ok = repo in (manifest.get("repositories") or [])
 
     pr = request(token, "GET", API + "/repos/" + repo + "/pulls/" + str(pr_number))
+    initial_base = _pr_base_binding(pr)
     reviews = paginate(token, API + "/repos/" + repo + "/pulls/" + str(pr_number) + "/reviews")
     reviewer_permissions, permission_errors = read_reviewer_permissions(token, repo, reviews)
 
@@ -1109,10 +1270,62 @@ def build_read_only_snapshot(
     aggregate = (
         _aggregate_effective(protection)
         if protection.get("complete")
-        else {"review": {}, "status_checks": [], "rule_types": set(), "bypass_actors": []}
+        else {
+            "review": {},
+            "status_checks": [],
+            "rule_types": set(),
+            "bypass_actors": [],
+            "strict_required_status_checks_policy": {"required": False, "sources": []},
+        }
     )
     if not protection.get("complete"):
         unknown_reasons.extend(protection.get("diagnostics") or ["protection evidence incomplete"])
+
+    expected_base_ref = protection.get("default_branch")
+    initial_base_ok = (
+        bool(expected_base_ref)
+        and _repo_key(initial_base.get("repository")) == repo.lower()
+        and initial_base.get("ref") == expected_base_ref
+    )
+    initial_base_errors = [] if initial_base_ok else [
+        f"initial PR base is not the protected repository default branch: "
+        f"observed={_repo_key(initial_base.get('repository'))}:{initial_base.get('ref')} "
+        f"expected={repo.lower()}:{expected_base_ref}"
+    ]
+
+    strict_policy = aggregate.get("strict_required_status_checks_policy") or {
+        "required": False,
+        "sources": [],
+    }
+    strict_sync_required = bool(strict_policy.get("required"))
+    strict_sync_evidence = _strict_sync_evidence_template(
+        repo, initial_base, expected_sha, required=strict_sync_required
+    )
+    strict_sync_collection_error = None
+    strict_sync_outcome = "SATISFIED"
+    strict_sync_errors: list[str] = []
+    if strict_sync_required:
+        try:
+            strict_sync_evidence = read_strict_required_check_synchronization(
+                token, repo, initial_base, expected_sha
+            )
+            if strict_sync_evidence.get("behind_by") == 0:
+                strict_sync_outcome = "SATISFIED"
+            else:
+                strict_sync_outcome = "UNSATISFIED"
+                strict_sync_errors.append(
+                    "strict required-check synchronization unsatisfied: "
+                    f"behind_by={strict_sync_evidence.get('behind_by')}"
+                )
+        except Exception as exc:
+            strict_sync_collection_error = str(exc)
+            strict_sync_outcome = "INDETERMINATE"
+            strict_sync_errors.append(
+                "strict required-check synchronization evidence unavailable: "
+                + strict_sync_collection_error
+            )
+            strict_sync_evidence["error"] = strict_sync_collection_error
+            unknown_reasons.extend(strict_sync_errors)
 
     try:
         check_evidence = read_required_check_evidence(token, repo, expected_sha)
@@ -1180,32 +1393,65 @@ def build_read_only_snapshot(
                 f"{review_gate.get('unresolved_outdated')}"
             )
 
-    base = pr.get("base") or {}
-    base_repo = ((base.get("repo") or {}).get("full_name") or "").lower()
-    base_ref = base.get("ref")
-    expected_base_ref = protection.get("default_branch")
-    base_ok = bool(expected_base_ref) and base_repo == repo.lower() and base_ref == expected_base_ref
-    base_errors = [] if base_ok else [
-        f"PR base is not the protected repository default branch: "
-        f"observed={base_repo}:{base_ref} expected={repo.lower()}:{expected_base_ref}"
-    ]
-
     final_pr = request(token, "GET", API + "/repos/" + repo + "/pulls/" + str(pr_number))
     final_head_sha = ((final_pr.get("head") or {}).get("sha"))
     head_stable = final_head_sha == expected_sha
     head_errors = [] if head_stable else [
         f"PR head changed during collection: final={final_head_sha} expected={expected_sha}"
     ]
+    final_base = _pr_base_binding(final_pr)
+    final_base_ok = (
+        bool(expected_base_ref)
+        and _repo_key(final_base.get("repository")) == repo.lower()
+        and final_base.get("ref") == expected_base_ref
+    )
+    base_identity_stable = _base_identity(initial_base) == _base_identity(final_base)
+    base_ok = initial_base_ok and final_base_ok and base_identity_stable
+    base_errors: list[str] = []
+    base_errors.extend(initial_base_errors)
+    if not final_base_ok:
+        base_errors.append(
+            "final PR base is not the protected repository default branch: "
+            f"observed={_repo_key(final_base.get('repository'))}:{final_base.get('ref')} "
+            f"expected={repo.lower()}:{expected_base_ref}"
+        )
+    if not base_identity_stable:
+        base_errors.append(
+            "PR base changed during collection: "
+            f"initial={_repo_key(initial_base.get('repository'))}:{initial_base.get('ref')} "
+            f"final={_repo_key(final_base.get('repository'))}:{final_base.get('ref')}"
+        )
+    strict_sync_stale = False
+    if strict_sync_required and strict_sync_evidence.get("availability") == "observed":
+        compared_base_sha = strict_sync_evidence.get("base_sha")
+        if final_base.get("sha") != compared_base_sha:
+            strict_sync_stale = True
+            strict_sync_outcome = (
+                "INDETERMINATE"
+                if strict_sync_outcome == "SATISFIED"
+                else strict_sync_outcome
+            )
+            stale_error = (
+                "strict required-check synchronization evidence stale: "
+                f"compared_base_sha={compared_base_sha} "
+                f"final_base_sha={final_base.get('sha')}"
+            )
+            strict_sync_errors.append(stale_error)
+            unknown_reasons.append(stale_error)
 
     evidence = {
         "head_sha": ((pr.get("head") or {}).get("sha")),
         "final_head_sha": final_head_sha,
+        "base": initial_base,
+        "final_base": final_base,
         "latest_push": push_evidence,
         "observed_push_event_provenance": observed_push_event_provenance,
         "caller_supplied_latest_push_actor": trusted_latest_push_actor,
         "reviewer_permissions": reviewer_permissions,
         "review_ids": [r.get("id") for r in reviews if r.get("id") is not None],
         "review_gate": review_gate,
+        "strict_required_status_checks_policy": strict_policy,
+        "strict_required_check_synchronization": strict_sync_evidence,
         "required_checks": aggregate.get("status_checks") or [],
         "check_runs": [
             {
@@ -1265,6 +1511,11 @@ def build_read_only_snapshot(
             "required-check-hold", expected_sha, "; ".join(check_errors),
             [{"kind": "required_check", **item} for item in evidence["required_checks"]],
         ))
+    if strict_sync_outcome != "SATISFIED":
+        debt.append(_operator_debt(
+            "strict-required-check-sync-hold", expected_sha, "; ".join(strict_sync_errors),
+            [{"kind": "strict_required_check_synchronization", **strict_sync_evidence}],
+        ))
     if not workflow_ok:
         debt.append(_operator_debt(
             "workflow-hold", expected_sha, "; ".join(workflow_errors),
@@ -1273,7 +1524,14 @@ def build_read_only_snapshot(
     if not base_ok:
         debt.append(_operator_debt(
             "protected-base-hold", repo + "#" + str(pr_number), "; ".join(base_errors),
-            [{"kind": "pull_request", "number": pr_number, "base_ref": base_ref, "base_repo": base_repo}],
+            [
+                {
+                    "kind": "pull_request",
+                    "number": pr_number,
+                    "base": initial_base,
+                    "final_base": final_base,
+                }
+            ],
         ))
     if not head_stable:
         debt.append(_operator_debt(
@@ -1298,6 +1556,8 @@ def build_read_only_snapshot(
         definite_failures.append("review thread control unsatisfied")
     if check_collection_error is None and protection.get("complete") and check_outcome == "UNSATISFIED":
         definite_failures.append("required check control unsatisfied")
+    if strict_sync_outcome == "UNSATISFIED":
+        definite_failures.append("strict required-check synchronization control unsatisfied")
     if workflow_collection_error is None and not workflow_ok:
         definite_failures.append("workflow control unsatisfied")
     if expected_base_ref and not base_ok:
@@ -1305,7 +1565,7 @@ def build_read_only_snapshot(
     if not head_stable:
         definite_failures.append("exact head became stale")
 
-    if not head_stable:
+    if not head_stable or not base_identity_stable or strict_sync_stale:
         evidence_state = "STALE"
     elif unknown_reasons:
         evidence_state = "UNKNOWN"
@@ -1327,6 +1587,8 @@ def build_read_only_snapshot(
         and control_outcome == "SATISFIED"
         and not debt
         and head_stable
+        and base_ok
+        and not strict_sync_stale
         else "HOLD"
     )
 
@@ -1349,6 +1611,15 @@ def build_read_only_snapshot(
             "checks": "complete" if not check_collection_error else "partial",
             "workflows": "complete" if not workflow_collection_error else "partial",
             "push_provenance": "complete" if not push_error else "partial",
+            "strict_required_check_synchronization": (
+                "not_required"
+                if not strict_sync_required
+                else "stale"
+                if strict_sync_stale
+                else "complete"
+                if strict_sync_collection_error is None
+                else "partial"
+            ),
             "dependencies_security": "not_collected",
         },
         "evidence": evidence,
@@ -1365,7 +1636,12 @@ def main() -> int:
     parser.add_argument("--repo")
     parser.add_argument("--pr-number", type=int)
     parser.add_argument("--expected-sha")
-    parser.add_argument("--required-workflow", action="append", default=[])
+    parser.add_argument(
+        "--required-workflow",
+        action="append",
+        default=[],
+        help="required pull_request workflow path or workflow id for exact-head readiness",
+    )
     args = parser.parse_args()
 
     try:

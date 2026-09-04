@@ -479,6 +479,49 @@ def test_required_check_identity_preserves_integration_id():
     assert "integration_id" in check["producer"]["source"]
 
 
+def test_ruleset_strict_required_checks_are_preserved():
+    s = surface()
+    rule = next(r for r in s["rulesets"][0]["rules"] if r["type"] == "required_status_checks")
+    rule["parameters"]["strict_required_status_checks_policy"] = False
+    s["rulesets"].append(
+        {
+            "id": 2,
+            "bypass_actors": [],
+            "rules": [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [{"context": "deploy"}],
+                    },
+                }
+            ],
+        }
+    )
+    policy = mod._aggregate_effective(s)["strict_required_status_checks_policy"]
+    assert policy["required"] is True
+    assert any(item["value"] is True for item in policy["sources"])
+    assert any("strict_required_status_checks_policy" in item["source"] for item in policy["sources"])
+
+
+def test_classic_strict_required_checks_are_preserved():
+    classic = {
+        "required_status_checks": {
+            "strict": True,
+            "checks": [{"context": "CI", "app_id": 321}],
+        }
+    }
+    policy = mod._aggregate_effective({"repository": {}, "rulesets": [], "classic": classic})["strict_required_status_checks_policy"]
+    assert policy["required"] is True
+    assert policy["sources"] == [
+        {
+            "source": "classic_branch_protection.required_status_checks.strict",
+            "value": True,
+            "available": True,
+        }
+    ]
+
+
 def test_same_context_wrong_producer_is_unsatisfied():
     required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=123, source="ruleset:1")]
     runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 999}}]
@@ -532,7 +575,7 @@ def test_github_actions_check_still_requires_resolved_workflow_provenance():
     required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
     runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321, "slug": "github-actions", "name": "GitHub Actions"}, "check_suite": {"id": 100}}]
     workflows = [{"id": 50, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 999, "event": "pull_request", "head_sha": "head", "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success"}]
-    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, ["validate"])
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, [".github/workflows/validate.yml"])
     assert outcome == "INDETERMINATE"
     assert any("workflow provenance unavailable" in error for error in errors)
 
@@ -549,7 +592,7 @@ def test_unrelated_successful_workflow_cannot_satisfy_required_check_gate():
     required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
     runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321}, "check_suite": {"id": 100}}]
     workflows = [{"id": 50, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 999, "event": "pull_request", "head_sha": "head", "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success"}]
-    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, ["validate"])
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, [".github/workflows/validate.yml"])
     assert outcome == "INDETERMINATE"
     assert any("workflow provenance unavailable" in error for error in errors)
 
@@ -564,7 +607,7 @@ def test_required_check_newer_failure_outranks_older_retry_success():
         {"id": 50, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 100, "event": "pull_request", "head_sha": "head", "run_number": 7, "run_attempt": 9, "status": "completed", "conclusion": "success"},
         {"id": 51, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 101, "event": "pull_request", "head_sha": "head", "run_number": 8, "run_attempt": 1, "status": "completed", "conclusion": "failure"},
     ]
-    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, ["validate"])
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, [".github/workflows/validate.yml"])
     assert outcome == "UNSATISFIED"
     assert any("required check non-success" in error for error in errors)
 
@@ -619,23 +662,170 @@ def test_latest_push_requires_repo_ref_and_exact_resulting_head():
         mod.paginate = original
 
 
+def test_missing_pr_head_repository_makes_push_provenance_unknown():
+    original = mod.paginate
+    seen = []
+    def fake_paginate(token, url):
+        seen.append(url)
+        return []
+    mod.paginate = fake_paginate
+    pr = {"head": {"ref": "feature", "repo": None}}
+    try:
+        try:
+            mod.read_latest_push_evidence("t", "mirrornode/example", pr, "head")
+        except RuntimeError as exc:
+            assert "head repository unavailable" in str(exc)
+        else:
+            raise AssertionError("missing PR head repository must fail closed")
+        assert seen == []
+    finally:
+        mod.paginate = original
+
+
 def test_workflow_scope_and_identity_are_required_for_exact_head():
     runs = [{"id": 1, "name": "CI", "workflow_id": 9, "path": ".github/workflows/ci.yml", "event": "push", "head_sha": "head", "run_number": 1, "run_attempt": 1, "created_at": "2026-01-01", "status": "completed", "conclusion": "success"}]
-    ok, errors = mod.evaluate_latest_runs(runs, ["CI"], "head")
+    ok, errors = mod.evaluate_latest_runs(runs, [".github/workflows/ci.yml"], "head")
     assert not ok and any("scope mismatch" in error for error in errors)
     runs[0]["event"] = "pull_request"
-    runs.append({**runs[0], "id": 2, "workflow_id": 10, "path": ".github/workflows/other.yml"})
-    ok, errors = mod.evaluate_latest_runs(runs, ["CI"], "head")
+    runs.append({**runs[0], "id": 2, "workflow_id": 10})
+    ok, errors = mod.evaluate_latest_runs(runs, [".github/workflows/ci.yml"], "head")
     assert not ok and any("ambiguous" in error for error in errors)
 
 
-def _install_snapshot_fakes(*, head_changes=False, unresolved=False, push_available=True):
-    state = {"reads": 0}
+def test_exact_head_display_name_only_workflow_requirement_holds():
+    runs = [
+        {
+            "id": 1,
+            "name": "Validate Estate Wrapper",
+            "workflow_id": 330861093,
+            "path": ".github/workflows/validate-estate.yml",
+            "event": "pull_request",
+            "head_sha": "head",
+            "run_number": 1,
+            "run_attempt": 1,
+            "created_at": "2026-01-01",
+            "status": "completed",
+            "conclusion": "success",
+        }
+    ]
+    ok, errors = mod.evaluate_latest_runs(runs, ["Validate Estate Wrapper"], "head")
+    assert not ok
+    assert any("trusted workflow identity unavailable" in error for error in errors)
+
+
+def test_exact_head_workflow_path_requirement_matches_exact_path():
+    runs = [
+        {
+            "id": 1,
+            "name": "Validate Estate Wrapper",
+            "workflow_id": 330861093,
+            "path": ".github/workflows/validate-estate.yml",
+            "event": "pull_request",
+            "head_sha": "head",
+            "run_number": 1,
+            "run_attempt": 1,
+            "created_at": "2026-01-01",
+            "status": "completed",
+            "conclusion": "success",
+        }
+    ]
+    ok, errors = mod.evaluate_latest_runs(runs, ["path:.github/workflows/validate-estate.yml"], "head")
+    assert ok and not errors
+
+
+def test_exact_head_workflow_id_requirement_matches_exact_id():
+    runs = [
+        {
+            "id": 1,
+            "name": "Validate Estate Wrapper",
+            "workflow_id": 330861093,
+            "path": ".github/workflows/validate-estate.yml",
+            "event": "pull_request",
+            "head_sha": "head",
+            "run_number": 1,
+            "run_attempt": 1,
+            "created_at": "2026-01-01",
+            "status": "completed",
+            "conclusion": "success",
+        }
+    ]
+    for requirement in (["330861093"], ["id:330861093"]):
+        ok, errors = mod.evaluate_latest_runs(runs, requirement, "head")
+        assert ok and not errors
+
+
+def test_same_display_name_wrong_workflow_path_cannot_clear_gate():
+    runs = [
+        {
+            "id": 1,
+            "name": "Validate Estate Wrapper",
+            "workflow_id": 42,
+            "path": ".github/workflows/unrelated.yml",
+            "event": "pull_request",
+            "head_sha": "head",
+            "run_number": 1,
+            "run_attempt": 1,
+            "created_at": "2026-01-01",
+            "status": "completed",
+            "conclusion": "success",
+        }
+    ]
+    ok, errors = mod.evaluate_latest_runs(runs, ["path:.github/workflows/validate-estate.yml"], "head")
+    assert not ok and any("required workflow missing" in error for error in errors)
+
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
+    check_runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321, "slug": "github-actions", "name": "GitHub Actions"}, "check_suite": {"id": 100}}]
+    workflow_runs = [{**runs[0], "check_suite_id": 100}]
+    outcome, check_errors = mod.evaluate_required_checks(
+        required,
+        check_runs,
+        [],
+        "head",
+        workflow_runs,
+        ["path:.github/workflows/validate-estate.yml"],
+    )
+    assert outcome == "INDETERMINATE"
+    assert any("workflow provenance unavailable" in error for error in check_errors)
+
+
+def _install_snapshot_fakes(
+    *,
+    head_changes=False,
+    unresolved=False,
+    push_available=True,
+    initial_base_repo="mirrornode/example",
+    initial_base_ref="main",
+    initial_base_sha="base",
+    final_base_repo=None,
+    final_base_ref=None,
+    final_base_sha=None,
+    strict_required=False,
+    compare_behind_by=0,
+    compare_unavailable=False,
+):
+    state = {"reads": 0, "compare_urls": []}
     def fake_request(token, method, url, payload=None, allow_404=False):
         if "/pulls/7" in url:
             state["reads"] += 1
             sha = "changed" if head_changes and state["reads"] > 1 else "head"
-            return {"head": {"sha": sha, "ref": "feature", "repo": {"full_name": "mirrornode/example"}}, "user": {"login": "author"}, "base": {"ref": "main", "repo": {"full_name": "mirrornode/example"}}}
+            if state["reads"] > 1:
+                base_repo = final_base_repo or initial_base_repo
+                base_ref = final_base_ref or initial_base_ref
+                base_sha = final_base_sha or initial_base_sha
+            else:
+                base_repo = initial_base_repo
+                base_ref = initial_base_ref
+                base_sha = initial_base_sha
+            return {
+                "head": {"sha": sha, "ref": "feature", "repo": {"full_name": "mirrornode/example"}},
+                "user": {"login": "author"},
+                "base": {"ref": base_ref, "sha": base_sha, "repo": {"full_name": base_repo}},
+            }
+        if "/compare/" in url:
+            state["compare_urls"].append(url)
+            if compare_unavailable:
+                raise RuntimeError("compare unavailable")
+            return {"behind_by": compare_behind_by}
         raise AssertionError(url)
     mod.request = fake_request
     mod.paginate = lambda token, url: [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
@@ -652,14 +842,105 @@ def _install_snapshot_fakes(*, head_changes=False, unresolved=False, push_availa
     good = surface()
     rule = next(r for r in good["rulesets"][0]["rules"] if r["type"] == "required_status_checks")
     rule["parameters"]["required_status_checks"] = [{"context": "CI", "integration_id": 321}]
+    if strict_required:
+        rule["parameters"]["strict_required_status_checks_policy"] = True
     mod.effective_default_branch_protection = lambda token, repo: good
+    return state
+
+
+def test_final_pr_reread_rejects_base_retarget_without_head_change():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(final_base_ref="release")
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "STALE"
+        assert snap["control_outcome"] == "UNSATISFIED"
+        assert snap["final_observed_head_sha"] == "head"
+        assert snap["evidence"]["base"]["ref"] == "main"
+        assert snap["evidence"]["final_base"]["ref"] == "release"
+        codes = {item["code"] for item in snap["operator_debt"]}
+        assert "protected-base-hold" in codes
+        assert "head-stability-hold" not in codes
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_strict_required_checks_hold_when_head_is_behind_base():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(strict_required=True, compare_behind_by=2)
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "HOLD"
+        assert snap["control_outcome"] == "UNSATISFIED"
+        assert snap["evidence"]["strict_required_check_synchronization"]["behind_by"] == 2
+        codes = {item["code"] for item in snap["operator_debt"]}
+        assert "strict-required-check-sync-hold" in codes
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_strict_required_checks_hold_when_compare_evidence_unavailable():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(strict_required=True, compare_unavailable=True)
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "UNKNOWN"
+        assert snap["control_outcome"] == "INDETERMINATE"
+        sync = snap["evidence"]["strict_required_check_synchronization"]
+        assert sync["availability"] == "unavailable"
+        assert sync["error"] == "compare unavailable"
+        codes = {item["code"] for item in snap["operator_debt"]}
+        assert "strict-required-check-sync-hold" in codes
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_strict_required_checks_pass_only_when_not_behind_exact_base():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    state = _install_snapshot_fakes(strict_required=True, compare_behind_by=0)
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "PASS"
+        assert snap["evidence_state"] == "VERIFIED"
+        assert snap["control_outcome"] == "SATISFIED"
+        sync = snap["evidence"]["strict_required_check_synchronization"]
+        assert sync["availability"] == "observed"
+        assert sync["base_sha"] == "base"
+        assert sync["expected_head_sha"] == "head"
+        assert sync["behind_by"] == 0
+        assert state["compare_urls"] == [sync["source_endpoint"]]
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_strict_sync_evidence_becomes_stale_if_base_sha_moves():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(strict_required=True, compare_behind_by=0, final_base_sha="new-base")
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "STALE"
+        assert snap["control_outcome"] == "INDETERMINATE"
+        sync = snap["evidence"]["strict_required_check_synchronization"]
+        assert sync["availability"] == "observed"
+        assert sync["base_sha"] == "base"
+        assert sync["behind_by"] == 0
+        assert snap["evidence"]["final_base"]["sha"] == "new-base"
+        codes = {item["code"] for item in snap["operator_debt"]}
+        assert "strict-required-check-sync-hold" in codes
+        assert "protected-base-hold" not in codes
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
 
 
 def test_read_only_snapshot_binds_verified_evidence_and_latest_runs():
     originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
     _install_snapshot_fakes()
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
         assert snap["status"] == "PASS"
         assert snap["evidence_state"] == "VERIFIED"
         assert snap["control_outcome"] == "SATISFIED"
@@ -674,7 +955,7 @@ def test_snapshot_unknown_push_evidence_cannot_pass():
     originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
     _install_snapshot_fakes(push_available=False)
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest(), trusted_latest_push_actor="pusher")
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest(), trusted_latest_push_actor="pusher")
         assert snap["status"] == "HOLD"
         assert snap["evidence_state"] == "UNKNOWN"
         assert snap["control_outcome"] == "INDETERMINATE"
@@ -688,7 +969,7 @@ def test_snapshot_definite_failure_remains_unsatisfied_with_unrelated_unknown_ev
     _install_snapshot_fakes(push_available=False)
     mod.read_required_check_evidence = lambda token, repo, sha: {"check_runs": [{"id": 44, "name": "CI", "head_sha": sha, "status": "completed", "conclusion": "failure", "app": {"id": 321}, "check_suite": {"id": 9001}}], "statuses": []}
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest(), trusted_latest_push_actor="pusher")
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest(), trusted_latest_push_actor="pusher")
         assert snap["status"] == "HOLD"
         assert snap["evidence_state"] == "UNKNOWN"
         assert snap["control_outcome"] == "UNSATISFIED"
@@ -700,7 +981,7 @@ def test_known_unresolved_mandatory_control_cannot_emit_overall_verified_evidenc
     originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
     _install_snapshot_fakes(unresolved=True)
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
         assert snap["status"] == "HOLD"
         assert snap["evidence_state"] == "HOLD"
         assert snap["control_outcome"] == "UNSATISFIED"
@@ -712,7 +993,7 @@ def test_snapshot_holds_on_head_change_and_unresolved_thread():
     originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
     _install_snapshot_fakes(head_changes=True, unresolved=True)
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
         assert snap["status"] == "HOLD"
         assert snap["evidence_state"] == "STALE"
         assert snap["control_outcome"] == "UNSATISFIED"
