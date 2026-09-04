@@ -109,7 +109,16 @@ def paginate_object_items(token: str, url: str, key: str) -> list[dict]:
 
 def validate_manifest(manifest: dict) -> list[str]:
     errors: list[str] = []
-    required = {"version", "ruleset_name", "target", "review_policy", "required_status_checks", "preserve_existing_rules", "repositories"}
+    required = {
+        "version",
+        "ruleset_name",
+        "target",
+        "review_policy",
+        "required_status_checks",
+        "preserve_existing_rules",
+        "repositories",
+        "single_operator_repositories",
+    }
     missing = sorted(required - set(manifest))
     if missing:
         errors.append(f"missing required fields: {', '.join(missing)}")
@@ -120,6 +129,22 @@ def validate_manifest(manifest: dict) -> list[str]:
     repos = manifest.get("repositories")
     if not isinstance(repos, list) or not repos or any(not isinstance(x, str) or "/" not in x for x in repos):
         errors.append("repositories must be a non-empty owner/repo string list")
+        repos = []
+    single_operator_repos = manifest.get("single_operator_repositories")
+    if (
+        not isinstance(single_operator_repos, list)
+        or any(not isinstance(x, str) or "/" not in x for x in single_operator_repos)
+    ):
+        errors.append("single_operator_repositories must be an owner/repo string list")
+        single_operator_repos = []
+    elif len(single_operator_repos) != len(set(single_operator_repos)):
+        errors.append("single_operator_repositories must not contain duplicates")
+    outside = sorted(set(single_operator_repos) - set(repos))
+    if outside:
+        errors.append(
+            "single_operator_repositories must be a subset of repositories: "
+            + ", ".join(outside)
+        )
     policy = manifest.get("review_policy")
     if not isinstance(policy, dict):
         errors.append("review_policy must be an object")
@@ -128,10 +153,10 @@ def validate_manifest(manifest: dict) -> list[str]:
     if unknown:
         errors.append(f"unsupported review policy fields: {', '.join(unknown)}")
     if not isinstance(policy.get("required_approving_review_count"), int) or policy.get("required_approving_review_count", 0) < 1:
-        errors.append("required_approving_review_count must be >= 1")
+        errors.append("estate default required_approving_review_count must be >= 1")
     for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval", "required_review_thread_resolution"):
         if policy.get(key) is not True:
-            errors.append(f"{key} must be true")
+            errors.append(f"estate default {key} must be true")
     methods = policy.get("allowed_merge_methods")
     if not isinstance(methods, list) or not methods or any(x not in {"merge", "squash", "rebase"} for x in methods):
         errors.append("allowed_merge_methods must be a non-empty supported list")
@@ -141,6 +166,14 @@ def validate_manifest(manifest: dict) -> list[str]:
     if manifest.get("bypass_actors", []) not in ([], None):
         errors.append("baseline must not permit bypass actors")
     return errors
+
+
+def review_policy_for_repo(manifest: dict, repo: str | None = None) -> dict:
+    policy = dict(manifest["review_policy"])
+    if repo and repo in (manifest.get("single_operator_repositories") or []):
+        policy["required_approving_review_count"] = 0
+        policy["require_last_push_approval"] = False
+    return policy
 
 
 def merge_restrictive_policy(existing: dict | None, floor: dict) -> dict:
@@ -538,7 +571,7 @@ def _aggregate_effective(surface: dict) -> dict:
                 )
     return aggregate
 
-def validate_effective_protection(surface: dict, manifest: dict) -> tuple[bool, list[str]]:
+def validate_effective_protection(surface: dict, manifest: dict, repo: str | None = None) -> tuple[bool, list[str]]:
     surface = _mark_strict_required_status_checks_policy_completeness(surface)
     diagnostics = list(surface.get("diagnostics") or [])
     if not surface.get("complete"):
@@ -552,7 +585,7 @@ def validate_effective_protection(surface: dict, manifest: dict) -> tuple[bool, 
         diagnostics.append("effective bypass actor present")
     if manifest.get("required_status_checks") == {"mode": "preserve_existing_nonempty"} and not aggregate["status_checks"]:
         diagnostics.append("no effective required status check")
-    policy = manifest["review_policy"]
+    policy = review_policy_for_repo(manifest, repo)
     observed = aggregate["review"]
     if int(observed.get("required_approving_review_count") or 0) < int(policy["required_approving_review_count"]):
         diagnostics.append("approval count below manifest floor")
@@ -573,7 +606,7 @@ def find_named_ruleset(rulesets: list[dict], name: str) -> dict | None:
     return matches[0] if matches else None
 
 
-def create_payload(manifest: dict) -> dict:
+def create_payload(manifest: dict, repo: str | None = None) -> dict:
     return {
         "name": manifest["ruleset_name"],
         "target": "branch",
@@ -583,13 +616,13 @@ def create_payload(manifest: dict) -> dict:
             {"type": "deletion"},
             {"type": "non_fast_forward"},
             {"type": "required_linear_history"},
-            desired_pull_request(None, manifest["review_policy"]),
+            desired_pull_request(None, review_policy_for_repo(manifest, repo)),
         ],
         "bypass_actors": [],
     }
 
 
-def update_payload(ruleset: dict, manifest: dict) -> dict:
+def update_payload(ruleset: dict, manifest: dict, repo: str | None = None) -> dict:
     if ruleset.get("bypass_actors"):
         raise RuntimeError("named ruleset contains bypass actors; refusing mutation")
     return {
@@ -597,7 +630,10 @@ def update_payload(ruleset: dict, manifest: dict) -> dict:
         "target": ruleset["target"],
         "enforcement": "active",
         "conditions": ruleset["conditions"],
-        "rules": strengthen_rules(ruleset.get("rules", []), manifest["review_policy"]),
+        "rules": strengthen_rules(
+            ruleset.get("rules", []),
+            review_policy_for_repo(manifest, repo),
+        ),
         "bypass_actors": [],
     }
 
@@ -1402,7 +1438,7 @@ def build_read_only_snapshot(
     else:
         workflow_ok, workflow_errors = evaluate_latest_runs(runs, required_workflows, expected_sha)
 
-    protection_ok, protection_errors = validate_effective_protection(protection, manifest)
+    protection_ok, protection_errors = validate_effective_protection(protection, manifest, repo)
 
     if check_collection_error or not protection.get("complete") or workflow_collection_error:
         check_outcome = "INDETERMINATE"
@@ -1727,7 +1763,7 @@ def main() -> int:
     failed = False
     for repo in manifest["repositories"]:
         surface = effective_default_branch_protection(token, repo)
-        ok, drift = validate_effective_protection(surface, manifest)
+        ok, drift = validate_effective_protection(surface, manifest, repo)
         print(f"{repo}: {'PASS' if ok else 'HOLD'}")
         for item in drift:
             print(f"  - {item}")
@@ -1745,14 +1781,14 @@ def main() -> int:
                     failed = True
                     print("  APPLY REFUSED: named ruleset does not target default branch")
                     continue
-                payload = update_payload(named, manifest)
+                payload = update_payload(named, manifest, repo)
                 request(token, "PUT", f"{API}/repos/{repo}/rulesets/{named['id']}", payload)
                 print("  applied: monotonic pull-request strengthening; non-PR rules preserved")
             else:
-                request(token, "POST", f"{API}/repos/{repo}/rulesets", create_payload(manifest))
+                request(token, "POST", f"{API}/repos/{repo}/rulesets", create_payload(manifest, repo))
                 print("  applied: created restrictive baseline ruleset")
             refreshed = effective_default_branch_protection(token, repo)
-            verified, remaining = validate_effective_protection(refreshed, manifest)
+            verified, remaining = validate_effective_protection(refreshed, manifest, repo)
             if not verified:
                 failed = True
                 print("  VERIFY HOLD")

@@ -27,6 +27,7 @@ def manifest():
         "ruleset_name": "MIRRORNODE Baseline Main Protection",
         "target": "~DEFAULT_BRANCH",
         "review_policy": dict(FLOOR),
+        "single_operator_repositories": [],
         "required_status_checks": {"mode": "preserve_existing_nonempty"},
         "bypass_actors": [],
         "preserve_existing_rules": True,
@@ -1077,6 +1078,103 @@ def test_snapshot_hardening_preserves_non_pr_rules_and_update_payload_behavior()
     check = next(r for r in payload["rules"] if r["type"] == "required_status_checks")
     assert check == existing["rules"][1]
     assert next(r for r in payload["rules"] if r["type"] == "pull_request")["parameters"]["required_approving_review_count"] == 2
+
+
+def test_single_operator_manifest_exception_is_explicit_and_repo_scoped():
+    m = manifest()
+    m["repositories"].append("mirrornode/MIRRORNODE-INFRA")
+    m["single_operator_repositories"] = ["mirrornode/MIRRORNODE-INFRA"]
+    assert mod.validate_manifest(m) == []
+
+    normal = mod.review_policy_for_repo(m, "mirrornode/example")
+    single = mod.review_policy_for_repo(m, "mirrornode/MIRRORNODE-INFRA")
+
+    assert normal["required_approving_review_count"] == 1
+    assert normal["require_last_push_approval"] is True
+    assert single["required_approving_review_count"] == 0
+    assert single["require_last_push_approval"] is False
+    assert m["review_policy"]["required_approving_review_count"] == 1
+    assert m["review_policy"]["require_last_push_approval"] is True
+
+
+def test_single_operator_manifest_exception_must_be_in_repository_scope():
+    m = manifest()
+    m["single_operator_repositories"] = ["mirrornode/MIRRORNODE-INFRA"]
+    errors = mod.validate_manifest(m)
+    assert any("subset of repositories" in error for error in errors)
+
+
+def test_single_operator_policy_allows_zero_approvals_without_weakening_other_controls():
+    m = manifest()
+    m["repositories"].append("mirrornode/MIRRORNODE-INFRA")
+    m["single_operator_repositories"] = ["mirrornode/MIRRORNODE-INFRA"]
+    review = dict(FLOOR)
+    review["required_approving_review_count"] = 0
+    review["require_last_push_approval"] = False
+
+    ok, errors = mod.validate_effective_protection(
+        surface(review=review),
+        m,
+        "mirrornode/MIRRORNODE-INFRA",
+    )
+    assert ok, errors
+
+    ok, errors = mod.validate_effective_protection(
+        surface(review=review),
+        m,
+        "mirrornode/example",
+    )
+    assert not ok
+    assert any("approval count below manifest floor" in error for error in errors)
+    assert any("require_last_push_approval not effectively enforced" in error for error in errors)
+
+
+def test_single_operator_create_payload_is_repo_scoped():
+    m = manifest()
+    m["repositories"].append("mirrornode/MIRRORNODE-INFRA")
+    m["single_operator_repositories"] = ["mirrornode/MIRRORNODE-INFRA"]
+
+    single_payload = mod.create_payload(m, "mirrornode/MIRRORNODE-INFRA")
+    normal_payload = mod.create_payload(m, "mirrornode/example")
+
+    single_review = next(
+        rule for rule in single_payload["rules"] if rule["type"] == "pull_request"
+    )["parameters"]
+    normal_review = next(
+        rule for rule in normal_payload["rules"] if rule["type"] == "pull_request"
+    )["parameters"]
+
+    assert single_review["required_approving_review_count"] == 0
+    assert single_review["require_last_push_approval"] is False
+    assert normal_review["required_approving_review_count"] == 1
+    assert normal_review["require_last_push_approval"] is True
+
+
+def test_single_operator_update_payload_never_weakens_existing_stronger_review_policy():
+    m = manifest()
+    m["repositories"].append("mirrornode/MIRRORNODE-INFRA")
+    m["single_operator_repositories"] = ["mirrornode/MIRRORNODE-INFRA"]
+    existing = {
+        "name": "MIRRORNODE Baseline Main Protection",
+        "target": "branch",
+        "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+        "bypass_actors": [],
+        "rules": [
+            {
+                "type": "pull_request",
+                "parameters": dict(FLOOR),
+            }
+        ],
+    }
+
+    payload = mod.update_payload(existing, m, "mirrornode/MIRRORNODE-INFRA")
+    review = next(
+        rule for rule in payload["rules"] if rule["type"] == "pull_request"
+    )["parameters"]
+
+    assert review["required_approving_review_count"] == 1
+    assert review["require_last_push_approval"] is True
+
 
 def run_all():
     tests = [(name, value) for name, value in globals().items() if name.startswith("test_") and callable(value)]

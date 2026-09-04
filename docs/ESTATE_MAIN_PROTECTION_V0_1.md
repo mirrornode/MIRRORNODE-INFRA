@@ -15,9 +15,9 @@ This contract exists because repository policy must be mechanically enforced rat
 For each repository in `manifests/estate-main-protection.v0.1.json`:
 
 - pull request required before merge;
-- at least one approving review required;
-- stale approvals dismissed when the head changes;
-- approval required from someone other than the actor responsible for the most recent push;
+- multi-operator repositories require at least one approving review;
+- multi-operator repositories dismiss stale approvals when the head changes and require approval after the most recent push;
+- repositories explicitly listed in `single_operator_repositories` may use zero required human approvals and no last-push approval requirement;
 - all review conversations resolved before merge;
 - branch deletion prohibited;
 - non-fast-forward updates prohibited;
@@ -27,9 +27,15 @@ For each repository in `manifests/estate-main-protection.v0.1.json`:
 
 Existing repository-specific required status checks and other rules must be preserved. This contract must not replace or weaken stronger local policy.
 
+## Single-operator exception
+
+`mirrornode/MIRRORNODE-INFRA` is explicitly designated as a single-operator repository. Its human-approval floor is zero because no independent repository collaborator is authorized. This exception does not create a bypass actor and does not weaken the required exact-head `validate` check, review-thread resolution, deletion protection, non-fast-forward protection, linear history, or squash-only merge policy.
+
+The estate-wide default remains one approving review with last-push approval. The exception is repository-specific and cannot lower stronger protection already present on any repository.
+
 ## Exact-head consequence
 
-Any push that changes the pull-request head invalidates approval evidence for the predecessor head. A successor head must satisfy its own checks and review requirements. No correction, reconciliation, or other subject-changing update may inherit ancestor-head clearance.
+Any push that changes the pull-request head invalidates predecessor-head evidence. Where human approval is required, predecessor-head approval evidence is invalidated as well. A successor head must satisfy its own checks and applicable review requirements. No correction, reconciliation, or other subject-changing update may inherit ancestor-head clearance.
 
 ## Tool
 
