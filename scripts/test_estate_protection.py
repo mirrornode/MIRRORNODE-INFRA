@@ -36,6 +36,7 @@ def surface(review=None, *, checks=("CI",), extra_rules=(), bypass=(), complete=
     rules = [
         {"type": "deletion"},
         {"type": "non_fast_forward"},
+        {"type": "required_linear_history"},
         {"type": "pull_request", "parameters": review or dict(FLOOR)},
     ]
     if checks is not None:
@@ -44,6 +45,12 @@ def surface(review=None, *, checks=("CI",), extra_rules=(), bypass=(), complete=
     return {
         "complete": complete,
         "diagnostics": [] if complete else ["unreadable"],
+        "default_branch": "main",
+        "repository": {
+            "allow_squash_merge": True,
+            "allow_merge_commit": False,
+            "allow_rebase_merge": False,
+        },
         "rulesets": [{"bypass_actors": list(bypass), "rules": rules}],
         "classic": None,
     }
@@ -122,6 +129,13 @@ def test_rejects_non_default_branch_target():
     assert mod.ref_condition_applies(ruleset, "main") is False
 
 
+def test_ruleset_wildcard_does_not_cross_path_separator():
+    single = {"target": "branch", "conditions": {"ref_name": {"include": ["refs/heads/*"], "exclude": []}}}
+    recursive = {"target": "branch", "conditions": {"ref_name": {"include": ["refs/heads/**"], "exclude": []}}}
+    assert mod.ref_condition_applies(single, "release/v1") is False
+    assert mod.ref_condition_applies(recursive, "release/v1") is True
+
+
 def test_rejects_missing_deletion_rule():
     s = surface()
     s["rulesets"][0]["rules"] = [r for r in s["rulesets"][0]["rules"] if r["type"] != "deletion"]
@@ -134,6 +148,22 @@ def test_rejects_missing_non_fast_forward_rule():
     s["rulesets"][0]["rules"] = [r for r in s["rulesets"][0]["rules"] if r["type"] != "non_fast_forward"]
     ok, errors = mod.validate_effective_protection(s, manifest())
     assert not ok and any("non_fast_forward" in x for x in errors)
+
+
+def test_rejects_missing_linear_history_rule():
+    s = surface()
+    s["rulesets"][0]["rules"] = [r for r in s["rulesets"][0]["rules"] if r["type"] != "required_linear_history"]
+    ok, errors = mod.validate_effective_protection(s, manifest())
+    assert not ok and any("required_linear_history" in x for x in errors)
+
+
+def test_rejects_effective_merge_method_outside_manifest():
+    permissive = dict(FLOOR)
+    permissive["allowed_merge_methods"] = ["merge", "squash"]
+    s = surface(review=permissive)
+    s["repository"]["allow_merge_commit"] = True
+    ok, errors = mod.validate_effective_protection(s, manifest())
+    assert not ok and any("merge methods" in x for x in errors)
 
 
 def test_rejects_effective_bypass_actor():
@@ -161,32 +191,55 @@ def test_rejects_unreadable_effective_ruleset():
 def test_rejects_ancestor_sha_approval():
     pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
     reviews = [{"state": "APPROVED", "commit_id": "old", "user": {"login": "reviewer"}}]
-    commits = [{"author": {"login": "pusher"}}]
-    ok, _ = mod.evaluate_exact_head_approval(pr, reviews, commits, "new")
+    ok, _ = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {"reviewer": "write"}, 1)
     assert not ok
 
 
 def test_accepts_exact_head_approval_only_conditionally():
     pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
     reviews = [{"state": "APPROVED", "commit_id": "new", "user": {"login": "reviewer"}}]
-    commits = [{"author": {"login": "pusher"}}]
-    ok, errors = mod.evaluate_exact_head_approval(pr, reviews, commits, "new")
+    ok, errors = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {"reviewer": "write"}, 1)
     assert ok and not errors
 
 
 def test_rejects_missing_exact_head_approval():
     pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
-    ok, _ = mod.evaluate_exact_head_approval(pr, [], [], "new")
+    ok, _ = mod.evaluate_exact_head_approval(pr, [], "new", "pusher", {}, 1)
     assert not ok
 
 
 def test_rejects_author_or_latest_pusher_approval():
     pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
-    commits = [{"author": {"login": "pusher"}}]
     for reviewer in ("author", "pusher"):
         reviews = [{"state": "APPROVED", "commit_id": "new", "user": {"login": reviewer}}]
-        ok, _ = mod.evaluate_exact_head_approval(pr, reviews, commits, "new")
+        ok, _ = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {reviewer: "write"}, 1)
         assert not ok
+
+
+def test_rejects_untrusted_or_ineligible_reviewer_evidence():
+    pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
+    reviews = [{"id": 1, "submitted_at": "2026-01-01", "state": "APPROVED", "commit_id": "new", "user": {"login": "reviewer"}}]
+    ok, errors = mod.evaluate_exact_head_approval(pr, reviews, "new", None, {"reviewer": "write"}, 1)
+    assert not ok and any("push actor" in x for x in errors)
+    ok, _ = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {"reviewer": "read"}, 1)
+    assert not ok
+
+
+def test_latest_review_state_supersedes_historical_approval():
+    pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
+    reviews = [
+        {"id": 1, "submitted_at": "2026-01-01", "state": "APPROVED", "commit_id": "new", "user": {"login": "reviewer"}},
+        {"id": 2, "submitted_at": "2026-01-02", "state": "CHANGES_REQUESTED", "commit_id": "new", "user": {"login": "reviewer"}},
+    ]
+    ok, _ = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {"reviewer": "write"}, 1)
+    assert not ok
+
+
+def test_enforces_effective_approval_count():
+    pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
+    reviews = [{"id": 1, "submitted_at": "2026-01-01", "state": "APPROVED", "commit_id": "new", "user": {"login": "one"}}]
+    ok, _ = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {"one": "write"}, 2)
+    assert not ok
 
 
 def test_rejects_latest_pending_or_failing_run_after_historical_success():
@@ -208,6 +261,15 @@ def test_accepts_latest_successful_run():
     ]
     ok, errors = mod.evaluate_latest_runs(runs, ["CI"])
     assert ok and not errors
+
+
+def test_newer_run_outranks_older_high_attempt_retry():
+    runs = [
+        {"id": 10, "name": "CI", "run_attempt": 9, "created_at": "2026-01-01", "status": "completed", "conclusion": "success"},
+        {"id": 11, "name": "CI", "run_attempt": 1, "created_at": "2026-01-02", "status": "completed", "conclusion": "failure"},
+    ]
+    ok, _ = mod.evaluate_latest_runs(runs, ["CI"])
+    assert not ok
 
 
 def test_rejects_ambiguous_token_sources():
@@ -236,31 +298,60 @@ def test_manifest_is_loaded_and_semantically_validated():
 
 
 def test_read_only_snapshot_binds_head_reviews_and_latest_runs():
-    originals = (mod.request, mod.paginate, mod.effective_default_branch_protection)
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection)
+    pr_reads = []
     def fake_request(token, method, url, payload=None, allow_404=False):
         if "/pulls/7" in url:
-            return {"head": {"sha": "head"}, "user": {"login": "author"}}
-        if "/actions/runs?" in url:
-            return {"workflow_runs": [{"id": 33, "name": "CI", "run_attempt": 2, "status": "completed", "conclusion": "success", "head_sha": "head"}]}
+            pr_reads.append(url)
+            return {"head": {"sha": "head"}, "user": {"login": "author"}, "base": {"ref": "main", "repo": {"full_name": "mirrornode/example"}}}
         raise AssertionError(url)
     def fake_paginate(token, url):
         if url.endswith("/reviews"):
             return [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
-        if url.endswith("/commits"):
-            return [{"author": {"login": "pusher"}}]
         raise AssertionError(url)
+    def fake_object_items(token, url, key):
+        assert key == "workflow_runs"
+        return [{"id": 33, "name": "CI", "run_attempt": 2, "created_at": "2026-01-01", "status": "completed", "conclusion": "success", "head_sha": "head"}]
     mod.request = fake_request
     mod.paginate = fake_paginate
+    mod.paginate_object_items = fake_object_items
+    mod.read_reviewer_permissions = lambda token, repo, reviews: ({"reviewer": "write"}, [])
     mod.effective_default_branch_protection = lambda token, repo: surface()
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest(), trusted_latest_push_actor="pusher")
         assert snap["status"] == "PASS"
+        assert len(pr_reads) == 2
         assert snap["observed_head_sha"] == "head"
         assert snap["evidence"]["review_ids"] == [22]
         assert snap["evidence"]["workflow_runs"][0]["id"] == 33
         assert snap["completeness"]["dependencies_security"] == "not_collected"
     finally:
-        mod.request, mod.paginate, mod.effective_default_branch_protection = originals
+        mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection = originals
+
+
+def test_snapshot_holds_on_head_change_or_required_check_mismatch():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection)
+    reads = 0
+    def fake_request(token, method, url, payload=None, allow_404=False):
+        nonlocal reads
+        if "/pulls/7" in url:
+            reads += 1
+            sha = "head" if reads == 1 else "changed"
+            return {"head": {"sha": sha}, "user": {"login": "author"}, "base": {"ref": "main", "repo": {"full_name": "mirrornode/example"}}}
+        raise AssertionError(url)
+    mod.request = fake_request
+    mod.paginate = lambda token, url: [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
+    mod.paginate_object_items = lambda token, url, key: []
+    mod.read_reviewer_permissions = lambda token, repo, reviews: ({"reviewer": "write"}, [])
+    mod.effective_default_branch_protection = lambda token, repo: surface(checks=("Required CI",))
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["Caller CI"], manifest(), trusted_latest_push_actor="pusher")
+        assert snap["status"] == "HOLD"
+        codes = {item["code"] for item in snap["operator_debt"]}
+        assert "workflow-hold" in codes
+        assert "head-stability-hold" in codes
+    finally:
+        mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection = originals
 
 
 def run_all():
