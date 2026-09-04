@@ -1,3 +1,4 @@
+# Operational retrigger: prior exact-head run ended in GitHub startup_failure before any job started.
 name: Validate Estate Wrapper
 
 on:

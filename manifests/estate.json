@@ -4,6 +4,7 @@
   "authority": {
     "cross_project_contract": "MIRRORNODE-INFRA",
     "application_implementation": "owning repository",
+    "repository_administration": "operator_required",
     "production_database_automation": "disabled_pending_canonical_migration_source"
   },
   "shared_services": {
@@ -21,7 +22,14 @@
       "observed_project_count": 25
     },
     "github": {
-      "owner": "mirrornode"
+      "owner": "mirrornode",
+      "repo_steward": {
+        "status": "implemented_proposal_only",
+        "checker_transport": "GET_ONLY",
+        "admin_write_transport": "ABSENT",
+        "operator_required_for_any_future_write": true,
+        "bot_only_mutation_forbidden": true
+      }
     }
   },
   "core_repositories": [
@@ -31,7 +39,7 @@
     {"name": "mirrornode-agent-runtime", "role": "agent_runtime", "supabase_runtime_consumer": "unverified"},
     {"name": "MIRRORNODE-CORE-HUB", "role": "governance_canon", "supabase_runtime_consumer": false},
     {"name": "mirrornode-workspace", "role": "private_workspace", "supabase_runtime_consumer": "unverified"},
-    {"name": "MIRRORNODE-INFRA", "role": "estate_wrapper", "supabase_runtime_consumer": false}
+    {"name": "MIRRORNODE-INFRA", "role": "estate_wrapper_and_repo_integrity_control_plane", "supabase_runtime_consumer": false}
   ],
   "vercel_projects_observed": [
     "mirrornode-platform",
@@ -65,6 +73,8 @@
     "No production database deployment from GitHub until canonical migration ownership is assigned.",
     "Every production website must map to exactly one owning source repository.",
     "Every shared service dependency must declare its owning repository or remain explicitly unverified.",
-    "Historical and duplicate deployment surfaces must be classified before deletion or consolidation."
+    "Historical and duplicate deployment surfaces must be classified before deletion or consolidation.",
+    "Repo Steward may observe and propose but cannot independently administer repositories.",
+    "Every future repository write requires explicit human Operator authorization and fails closed without it."
   ]
 }

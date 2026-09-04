@@ -1,0 +1,45 @@
+{
+  "schema_version": "0.1.0",
+  "name": "MIRRORNODE Repo Steward Main Protection",
+  "target": "branch",
+  "pattern": "main",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "required_rules": {
+    "deletion": "blocked",
+    "force_push": "blocked",
+    "pull_request_required": true,
+    "minimum_approving_reviews": 1,
+    "dismiss_stale_reviews": true,
+    "require_last_push_approval": true,
+    "require_conversation_resolution": true,
+    "require_status_checks": true,
+    "require_branch_up_to_date": true,
+    "require_signed_commits": false
+  },
+  "dual_control": {
+    "operator_required": true,
+    "approved_advisory_attestation_required": true,
+    "minimum_advisory_attestations": 1,
+    "approved_lanes": ["OPENAI_ASSISTANT", "PERPLEXITY", "CLAUDE"],
+    "required_check_name": "Repo Steward Dual Control",
+    "trusted_producer": {
+      "type": "GITHUB_APP",
+      "binding_required": true,
+      "app_id": null,
+      "slug": null,
+      "state": "UNBOUND_FAIL_CLOSED"
+    },
+    "note": "The required check is not eligible for live enforcement until its exact trusted GitHub App/integration identity is recorded. A context name alone is insufficient. Until producer identity is bound, Repo Steward Dual Control must be treated as unavailable and the rollout remains HOLD."
+  },
+  "deployment_order": [
+    "MIRRORNODE-CORE-HUB",
+    "MIRRORNODE-INFRA",
+    "mirrornode-agent-runtime",
+    "mirrornode-operator-console",
+    "mirrornode-osiris",
+    "mn-supply-continuity",
+    "mirrornode-platform",
+    "mirrornode-parallax"
+  ]
+}

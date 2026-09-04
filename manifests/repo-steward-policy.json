@@ -1,0 +1,39 @@
+{
+  "schema_version": "0.1.0",
+  "agent": "REPO_STEWARD",
+  "mode": "READ_ONLY_CHECKER_WITH_PROPOSAL_ONLY_ADMIN",
+  "approved_human_reviewer_ids": [],
+  "reviewer_identity_note": "Exact-head review remains HOLD until the Operator records approved human GitHub numeric user IDs. Login spelling, account type, and repository permission do not establish human identity.",
+  "authorization_boundary": {
+    "human_operator_required": true,
+    "approved_advisory_attestation_required": true,
+    "minimum_advisory_attestations": 1,
+    "bot_only_mutation_forbidden": true,
+    "operator_only_control_plane_mutation_forbidden": true,
+    "delegated_merge_authority_forbidden": true,
+    "write_transport_present": false,
+    "advisory_lanes": ["OPENAI_ASSISTANT", "PERPLEXITY", "CLAUDE"],
+    "rule": "Any future Repo Steward repository mutation requires explicit human Operator authorization plus at least one independent attestation from an approved advisory lane. Advisory lanes may inspect, recommend, prepare, or review, but may not independently authorize or execute repository administration."
+  },
+  "repositories": [
+    {"repository":"mirrornode/MIRRORNODE-CORE-HUB","criticality":"constitutional","enabled":true,"require_ci":true,"require_exact_head_review":true,"require_protected_default_branch":true,"required_workflows":["MIRRORNODE Audit","Canon Gate"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/MIRRORNODE-INFRA","criticality":"control_plane","enabled":true,"require_ci":true,"require_exact_head_review":true,"require_protected_default_branch":true,"required_workflows":["Repo Steward CI","Validate Estate Wrapper"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/mirrornode-agent-runtime","criticality":"execution","enabled":true,"require_ci":true,"require_exact_head_review":true,"require_protected_default_branch":true,"required_workflows":["PR Validation"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/mirrornode-operator-console","criticality":"operator_surface","enabled":true,"require_ci":true,"require_exact_head_review":true,"require_protected_default_branch":true,"required_workflows":["PR Validation","Mainline Audit"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/mirrornode-platform","criticality":"customer_production","enabled":true,"require_ci":true,"require_exact_head_review":false,"require_protected_default_branch":true,"required_workflows":["CI","Canon Gate"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/mirrornode-osiris","criticality":"evidence_processing","enabled":true,"require_ci":true,"require_exact_head_review":true,"require_protected_default_branch":true,"required_workflows":["PR Validation"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/mn-supply-continuity","criticality":"continuity_state","enabled":true,"require_ci":true,"require_exact_head_review":true,"require_protected_default_branch":true,"required_workflows":["PR Validation"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]},
+    {"repository":"mirrornode/mirrornode-parallax","criticality":"public_front_of_house","enabled":true,"require_ci":true,"require_exact_head_review":false,"require_protected_default_branch":true,"required_workflows":["Parallax Front-of-House Gate"],"merge_authority":"OPERATOR","admin_actions":["PROPOSE_FILE","PROPOSE_WORKFLOW","OPEN_PR","REQUEST_REVIEW"]}
+  ],
+  "invariants": [
+    "Checker is GET-only and cannot mutate GitHub.",
+    "Repo Admin v0.1 has no mutation transport and cannot execute proposals.",
+    "No component may certify its own repair as merge authority.",
+    "A review bound to an ancestor SHA does not clear a changed head.",
+    "CI success never implies approval, deployment, or merge authority.",
+    "Critical default branches must be protected; an observed unprotected default branch is FAIL.",
+    "No autonomous agent, bot identity, service account, coding agent, or advisory model may independently administer repositories.",
+    "Every future Repo Steward write path requires explicit human Operator authorization plus at least one independent approved advisory attestation and must fail closed if either side is absent or unverifiable.",
+    "Permission expansion, ruleset mutation, credential changes, direct-default-branch writes, destructive actions, deployment enablement, and merge remain closed unless separately authorized under the same dual-control rule."
+  ]
+}
