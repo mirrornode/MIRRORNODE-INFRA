@@ -11,6 +11,10 @@
     "require_extra_approval_for_unattributed_changes": true,
     "allowed_merge_methods": ["squash"]
   },
+  "required_status_checks": {
+    "mode": "preserve_existing_nonempty"
+  },
+  "bypass_actors": [],
   "preserve_existing_rules": true,
   "repositories": [
     "mirrornode/MIRRORNODE-CORE-HUB",
