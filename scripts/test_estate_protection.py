@@ -297,62 +297,224 @@ def test_manifest_is_loaded_and_semantically_validated():
 
 
 
-def test_read_only_snapshot_binds_head_reviews_and_latest_runs():
-    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection)
-    pr_reads = []
+
+def test_unsupported_ruleset_pattern_is_indeterminate():
+    ruleset = {"target": "branch", "conditions": {"ref_name": {"include": ["refs/heads/release/[0-9]"], "exclude": []}}}
+    assert mod.ref_condition_applies(ruleset, "release/1") is None
+
+
+def test_unknown_exclusion_pattern_is_indeterminate():
+    ruleset = {"target": "branch", "conditions": {"ref_name": {"include": ["~ALL"], "exclude": ["refs/heads/release/[0-9]"]}}}
+    assert mod.ref_condition_applies(ruleset, "release/1") is None
+
+
+def test_classic_branch_name_is_percent_encoded_as_one_segment():
+    originals = (mod.request, mod.list_all_rulesets)
+    seen = []
     def fake_request(token, method, url, payload=None, allow_404=False):
-        if "/pulls/7" in url:
-            pr_reads.append(url)
-            return {"head": {"sha": "head"}, "user": {"login": "author"}, "base": {"ref": "main", "repo": {"full_name": "mirrornode/example"}}}
+        seen.append(url)
+        if url.endswith("/repos/mirrornode/example"):
+            return {"default_branch": "release/v1"}
+        if "/branches/release%2Fv1/protection" in url:
+            return None
         raise AssertionError(url)
-    def fake_paginate(token, url):
-        if url.endswith("/reviews"):
-            return [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
-        raise AssertionError(url)
-    def fake_object_items(token, url, key):
-        assert key == "workflow_runs"
-        return [{"id": 33, "name": "CI", "run_attempt": 2, "created_at": "2026-01-01", "status": "completed", "conclusion": "success", "head_sha": "head"}]
     mod.request = fake_request
-    mod.paginate = fake_paginate
-    mod.paginate_object_items = fake_object_items
-    mod.read_reviewer_permissions = lambda token, repo, reviews: ({"reviewer": "write"}, [])
-    mod.effective_default_branch_protection = lambda token, repo: surface()
+    mod.list_all_rulesets = lambda token, repo: []
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest(), trusted_latest_push_actor="pusher")
-        assert snap["status"] == "PASS"
-        assert len(pr_reads) == 2
-        assert snap["observed_head_sha"] == "head"
-        assert snap["evidence"]["review_ids"] == [22]
-        assert snap["evidence"]["workflow_runs"][0]["id"] == 33
-        assert snap["completeness"]["dependencies_security"] == "not_collected"
+        result = mod.effective_default_branch_protection("t", "mirrornode/example")
+        assert result["complete"] is True
+        assert result["classic_state"] == "absent"
+        assert any("/branches/release%2Fv1/protection" in url for url in seen)
     finally:
-        mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection = originals
+        mod.request, mod.list_all_rulesets = originals
 
 
-def test_snapshot_holds_on_head_change_or_required_check_mismatch():
-    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection)
-    reads = 0
+def test_classic_403_is_incomplete_not_absence():
+    originals = (mod.request, mod.list_all_rulesets)
     def fake_request(token, method, url, payload=None, allow_404=False):
-        nonlocal reads
+        if url.endswith("/repos/mirrornode/example"):
+            return {"default_branch": "main"}
+        if "/branches/main/protection" in url:
+            raise RuntimeError("GitHub GET denied: 403")
+        raise AssertionError(url)
+    mod.request = fake_request
+    mod.list_all_rulesets = lambda token, repo: []
+    try:
+        result = mod.effective_default_branch_protection("t", "mirrornode/example")
+        assert result["complete"] is False
+        assert result["classic_state"] == "denied_or_unreadable"
+        assert any("403" in item for item in result["diagnostics"])
+    finally:
+        mod.request, mod.list_all_rulesets = originals
+
+
+def test_missing_bypass_field_is_not_empty_bypass_list():
+    originals = (mod.request, mod.list_all_rulesets)
+    def fake_request(token, method, url, payload=None, allow_404=False):
+        if url.endswith("/repos/mirrornode/example"):
+            return {"default_branch": "main"}
+        if "/branches/main/protection" in url:
+            return None
+        raise AssertionError(url)
+    mod.request = fake_request
+    mod.list_all_rulesets = lambda token, repo: [{"id": 1, "target": "branch", "enforcement": "active", "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}, "rules": []}]
+    try:
+        missing = mod.effective_default_branch_protection("t", "mirrornode/example")
+        assert missing["complete"] is False
+        mod.list_all_rulesets = lambda token, repo: [{"id": 1, "target": "branch", "enforcement": "active", "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}, "bypass_actors": [], "rules": []}]
+        empty = mod.effective_default_branch_protection("t", "mirrornode/example")
+        assert empty["complete"] is True
+    finally:
+        mod.request, mod.list_all_rulesets = originals
+
+
+def test_classic_linear_history_contributes_required_rule():
+    s = {"repository": {"allow_squash_merge": True}, "rulesets": [], "classic": {"required_linear_history": {"enabled": True}, "allow_deletions": {"enabled": False}, "allow_force_pushes": {"enabled": False}, "enforce_admins": {"enabled": True}, "required_pull_request_reviews": {}}}
+    assert "required_linear_history" in mod._aggregate_effective(s)["rule_types"]
+
+
+def test_required_check_identity_preserves_integration_id():
+    s = surface()
+    rule = next(r for r in s["rulesets"][0]["rules"] if r["type"] == "required_status_checks")
+    rule["parameters"]["required_status_checks"] = [{"context": "validate", "integration_id": 12345}]
+    check = mod._aggregate_effective(s)["status_checks"][0]
+    assert check["context"] == "validate"
+    assert check["producer"]["id"] == 12345
+    assert check["producer"]["bound"] is True
+    assert "integration_id" in check["producer"]["source"]
+
+
+def test_same_context_wrong_producer_is_unsatisfied():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=123, source="ruleset:1")]
+    runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 999}}]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head")
+    assert outcome == "UNSATISFIED"
+    assert any("producer mismatch" in error for error in errors)
+
+
+def test_unknown_required_check_producer_holds():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=None, source="ruleset:1", field_present=False)]
+    outcome, errors = mod.evaluate_required_checks(required, [], [], "head")
+    assert outcome == "INDETERMINATE"
+    assert any("producer visibility" in error for error in errors)
+
+
+def test_review_threads_paginate_to_completion():
+    original = mod.request
+    calls = []
+    def fake_request(token, method, url, payload=None, allow_404=False):
+        calls.append(payload["variables"]["cursor"])
+        if payload["variables"]["cursor"] is None:
+            return {"data": {"repository": {"pullRequest": {"reviewDecision": "APPROVED", "reviewThreads": {"nodes": [{"id": "T1", "isResolved": True, "isOutdated": False}], "pageInfo": {"hasNextPage": True, "endCursor": "next"}}}}}}
+        return {"data": {"repository": {"pullRequest": {"reviewDecision": "APPROVED", "reviewThreads": {"nodes": [{"id": "T2", "isResolved": False, "isOutdated": False}], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
+    mod.request = fake_request
+    try:
+        gate = mod.read_review_gate_state("t", "mirrornode/example", 7)
+        assert calls == [None, "next"]
+        assert gate["total_discovered"] == 2
+        assert gate["unresolved_current"] == 1
+    finally:
+        mod.request = original
+
+
+def test_latest_push_requires_repo_ref_and_exact_resulting_head():
+    original = mod.paginate
+    mod.paginate = lambda token, url: [
+        {"id": "1", "type": "PushEvent", "created_at": "2026-01-01", "actor": {"login": "alice"}, "payload": {"ref": "refs/heads/feature", "head": "wrong"}},
+        {"id": "2", "type": "PushEvent", "created_at": "2026-01-02", "actor": {"login": "bob"}, "payload": {"ref": "refs/heads/feature", "head": "head"}},
+    ]
+    pr = {"head": {"ref": "feature", "repo": {"full_name": "mirrornode/example"}}}
+    try:
+        evidence = mod.read_latest_push_evidence("t", "mirrornode/example", pr, "head")
+        assert evidence["actor"] == "bob"
+        assert evidence["resulting_head_sha"] == "head"
+    finally:
+        mod.paginate = original
+
+
+def test_workflow_scope_and_identity_are_required_for_exact_head():
+    runs = [{"id": 1, "name": "CI", "workflow_id": 9, "path": ".github/workflows/ci.yml", "event": "push", "head_sha": "head", "run_number": 1, "run_attempt": 1, "created_at": "2026-01-01", "status": "completed", "conclusion": "success"}]
+    ok, errors = mod.evaluate_latest_runs(runs, ["CI"], "head")
+    assert not ok and any("scope mismatch" in error for error in errors)
+    runs[0]["event"] = "pull_request"
+    runs.append({**runs[0], "id": 2, "workflow_id": 10, "path": ".github/workflows/other.yml"})
+    ok, errors = mod.evaluate_latest_runs(runs, ["CI"], "head")
+    assert not ok and any("ambiguous" in error for error in errors)
+
+
+def _install_snapshot_fakes(*, head_changes=False, unresolved=False, push_available=True):
+    state = {"reads": 0}
+    def fake_request(token, method, url, payload=None, allow_404=False):
         if "/pulls/7" in url:
-            reads += 1
-            sha = "head" if reads == 1 else "changed"
-            return {"head": {"sha": sha}, "user": {"login": "author"}, "base": {"ref": "main", "repo": {"full_name": "mirrornode/example"}}}
+            state["reads"] += 1
+            sha = "changed" if head_changes and state["reads"] > 1 else "head"
+            return {"head": {"sha": sha, "ref": "feature", "repo": {"full_name": "mirrornode/example"}}, "user": {"login": "author"}, "base": {"ref": "main", "repo": {"full_name": "mirrornode/example"}}}
         raise AssertionError(url)
     mod.request = fake_request
     mod.paginate = lambda token, url: [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
-    mod.paginate_object_items = lambda token, url, key: []
-    mod.read_reviewer_permissions = lambda token, repo, reviews: ({"reviewer": "write"}, [])
-    mod.effective_default_branch_protection = lambda token, repo: surface(checks=("Required CI",))
+    mod.paginate_object_items = lambda token, url, key: [{"id": 33, "name": "CI", "workflow_id": 9, "path": ".github/workflows/ci.yml", "event": "pull_request", "run_number": 2, "run_attempt": 1, "created_at": "2026-01-01", "status": "completed", "conclusion": "success", "head_sha": "head"}]
+    mod.read_reviewer_permissions = lambda token, repo, reviews: ({"reviewer": {"permission": "write"}}, [])
+    mod.read_review_gate_state = lambda token, repo, number: {"collection_state": "complete", "review_decision": "APPROVED", "total_discovered": 1 if unresolved else 0, "unresolved_current": 1 if unresolved else 0, "unresolved_outdated": 0, "threads": [{"id": "T1", "is_resolved": False, "is_outdated": False}] if unresolved else []}
+    if push_available:
+        mod.read_latest_push_evidence = lambda token, repo, pr, sha: {"actor": "pusher", "repository": repo, "ref": "refs/heads/feature", "resulting_head_sha": sha, "event_type": "PushEvent"}
+    else:
+        def no_push(*args):
+            raise RuntimeError("push provenance unavailable")
+        mod.read_latest_push_evidence = no_push
+    mod.read_required_check_evidence = lambda token, repo, sha: {"check_runs": [{"id": 44, "name": "CI", "head_sha": sha, "status": "completed", "conclusion": "success", "app": {"id": 321}}], "statuses": []}
+    good = surface()
+    rule = next(r for r in good["rulesets"][0]["rules"] if r["type"] == "required_status_checks")
+    rule["parameters"]["required_status_checks"] = [{"context": "CI", "integration_id": 321}]
+    mod.effective_default_branch_protection = lambda token, repo: good
+
+
+def test_read_only_snapshot_binds_verified_evidence_and_latest_runs():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes()
     try:
-        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["Caller CI"], manifest(), trusted_latest_push_actor="pusher")
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        assert snap["status"] == "PASS"
+        assert snap["evidence_state"] == "VERIFIED"
+        assert snap["control_outcome"] == "SATISFIED"
+        assert snap["evidence"]["latest_push"]["actor"] == "pusher"
+        assert snap["evidence"]["required_checks"][0]["producer"]["id"] == 321
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_snapshot_unknown_push_evidence_cannot_pass():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(push_available=False)
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest(), trusted_latest_push_actor="pusher")
         assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "UNKNOWN"
+        assert snap["control_outcome"] == "INDETERMINATE"
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_snapshot_holds_on_head_change_and_unresolved_thread():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(head_changes=True, unresolved=True)
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "STALE"
+        assert snap["control_outcome"] == "UNSATISFIED"
         codes = {item["code"] for item in snap["operator_debt"]}
-        assert "workflow-hold" in codes
+        assert "review-thread-hold" in codes
         assert "head-stability-hold" in codes
     finally:
-        mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.effective_default_branch_protection = originals
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
 
+
+def test_snapshot_hardening_preserves_non_pr_rules_and_update_payload_behavior():
+    existing = {"name": "MIRRORNODE Baseline Main Protection", "target": "branch", "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}, "bypass_actors": [], "rules": [{"type": "deletion"}, {"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "CI", "integration_id": 7}]}}, {"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]}
+    payload = mod.update_payload(existing, manifest())
+    check = next(r for r in payload["rules"] if r["type"] == "required_status_checks")
+    assert check == existing["rules"][1]
+    assert next(r for r in payload["rules"] if r["type"] == "pull_request")["parameters"]["required_approving_review_count"] == 2
 
 def run_all():
     tests = [(name, value) for name, value in globals().items() if name.startswith("test_") and callable(value)]
