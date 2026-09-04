@@ -283,6 +283,44 @@ def _classic_bypass_visibility_diagnostics(classic: dict) -> list[str]:
     return diagnostics
 
 
+def _strict_required_status_checks_policy_diagnostics(surface: dict) -> list[str]:
+    diagnostics: list[str] = []
+    for ruleset in surface.get("rulesets") or []:
+        if not isinstance(ruleset, dict):
+            continue
+        ruleset_id = ruleset.get("id")
+        for rule in ruleset.get("rules") or []:
+            if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+                continue
+            params = rule.get("parameters") or {}
+            field = "strict_required_status_checks_policy"
+            if isinstance(params, dict) and field in params and not isinstance(params.get(field), bool):
+                diagnostics.append(
+                    f"ruleset:{ruleset_id}:required_status_checks.{field} unavailable or malformed"
+                )
+    classic = surface.get("classic") or {}
+    if isinstance(classic, dict):
+        checks = classic.get("required_status_checks") or {}
+        if isinstance(checks, dict) and "strict" in checks and not isinstance(checks.get("strict"), bool):
+            diagnostics.append(
+                "classic_branch_protection.required_status_checks.strict unavailable or malformed"
+            )
+    return diagnostics
+
+
+def _mark_strict_required_status_checks_policy_completeness(surface: dict) -> dict:
+    malformed = _strict_required_status_checks_policy_diagnostics(surface)
+    if not malformed:
+        return surface
+    diagnostics = list(surface.get("diagnostics") or [])
+    for diagnostic in malformed:
+        if diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
+    surface["diagnostics"] = diagnostics
+    surface["complete"] = False
+    return surface
+
+
 def effective_default_branch_protection(token: str, repo: str) -> dict:
     repo_info = request(token, "GET", f"{API}/repos/{repo}")
     if not isinstance(repo_info, dict):
@@ -337,7 +375,7 @@ def effective_default_branch_protection(token: str, repo: str) -> dict:
             "classic": None,
             "classic_state": "denied_or_unreadable",
         }
-    return {
+    return _mark_strict_required_status_checks_policy_completeness({
         "complete": not diagnostics,
         "diagnostics": diagnostics,
         "repo": repo,
@@ -346,7 +384,7 @@ def effective_default_branch_protection(token: str, repo: str) -> dict:
         "rulesets": applicable,
         "classic": classic,
         "classic_state": classic_state,
-    }
+    })
 
 
 def _required_check_identity(context: str, *, producer_kind: str, producer_id, source: str, field_present: bool = True) -> dict:
@@ -501,6 +539,7 @@ def _aggregate_effective(surface: dict) -> dict:
     return aggregate
 
 def validate_effective_protection(surface: dict, manifest: dict) -> tuple[bool, list[str]]:
+    surface = _mark_strict_required_status_checks_policy_completeness(surface)
     diagnostics = list(surface.get("diagnostics") or [])
     if not surface.get("complete"):
         diagnostics.append("effective protection surface incomplete")
@@ -1139,8 +1178,8 @@ def _repo_key(repository: str | None) -> str:
     return str(repository or "").lower()
 
 
-def _base_identity(base: dict) -> tuple[str, str | None]:
-    return (_repo_key(base.get("repository")), base.get("ref"))
+def _base_identity(base: dict) -> tuple[str, str | None, str | None]:
+    return (_repo_key(base.get("repository")), base.get("ref"), base.get("sha"))
 
 
 def _compare_endpoint(repo: str, base_sha: str | None, expected_sha: str) -> str | None:
@@ -1266,7 +1305,9 @@ def build_read_only_snapshot(
         workflow_collection_error = str(exc)
         unknown_reasons.append("workflow evidence unavailable: " + workflow_collection_error)
 
-    protection = effective_default_branch_protection(token, repo)
+    protection = _mark_strict_required_status_checks_policy_completeness(
+        effective_default_branch_protection(token, repo)
+    )
     aggregate = (
         _aggregate_effective(protection)
         if protection.get("complete")
@@ -1416,11 +1457,14 @@ def build_read_only_snapshot(
             f"expected={repo.lower()}:{expected_base_ref}"
         )
     if not base_identity_stable:
-        base_errors.append(
+        base_changed_error = (
             "PR base changed during collection: "
-            f"initial={_repo_key(initial_base.get('repository'))}:{initial_base.get('ref')} "
-            f"final={_repo_key(final_base.get('repository'))}:{final_base.get('ref')}"
+            f"initial={_repo_key(initial_base.get('repository'))}:{initial_base.get('ref')}@{initial_base.get('sha')} "
+            f"final={_repo_key(final_base.get('repository'))}:{final_base.get('ref')}@{final_base.get('sha')}"
         )
+        base_errors.append(base_changed_error)
+        if initial_base_ok and final_base_ok:
+            unknown_reasons.append(base_changed_error)
     strict_sync_stale = False
     if strict_sync_required and strict_sync_evidence.get("availability") == "observed":
         compared_base_sha = strict_sync_evidence.get("base_sha")
@@ -1560,7 +1604,7 @@ def build_read_only_snapshot(
         definite_failures.append("strict required-check synchronization control unsatisfied")
     if workflow_collection_error is None and not workflow_ok:
         definite_failures.append("workflow control unsatisfied")
-    if expected_base_ref and not base_ok:
+    if expected_base_ref and not (initial_base_ok and final_base_ok):
         definite_failures.append("governed base control unsatisfied")
     if not head_stable:
         definite_failures.append("exact head became stale")
@@ -1599,6 +1643,7 @@ def build_read_only_snapshot(
         "expected_head_sha": expected_sha,
         "observed_head_sha": evidence["head_sha"],
         "final_observed_head_sha": final_head_sha,
+        "base_identity_stable": base_identity_stable,
         "observed_at": collected_at,
         "collector": {"mode": "read-only", "credential_source": "environment"},
         "policy": {"version": manifest.get("version"), "sha256": policy_sha256},

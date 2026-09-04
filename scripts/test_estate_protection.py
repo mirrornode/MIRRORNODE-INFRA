@@ -18,6 +18,8 @@ FLOOR = {
     "allowed_merge_methods": ["squash"],
 }
 
+STRICT_POLICY_ABSENT = object()
+
 
 def manifest():
     return {
@@ -800,6 +802,8 @@ def _install_snapshot_fakes(
     final_base_ref=None,
     final_base_sha=None,
     strict_required=False,
+    ruleset_strict_policy=STRICT_POLICY_ABSENT,
+    classic_strict_policy=STRICT_POLICY_ABSENT,
     compare_behind_by=0,
     compare_unavailable=False,
 ):
@@ -844,8 +848,49 @@ def _install_snapshot_fakes(
     rule["parameters"]["required_status_checks"] = [{"context": "CI", "integration_id": 321}]
     if strict_required:
         rule["parameters"]["strict_required_status_checks_policy"] = True
+    if ruleset_strict_policy is not STRICT_POLICY_ABSENT:
+        rule["parameters"]["strict_required_status_checks_policy"] = ruleset_strict_policy
+    if classic_strict_policy is not STRICT_POLICY_ABSENT:
+        good["classic"] = {
+            "required_status_checks": {
+                "strict": classic_strict_policy,
+                "checks": [{"context": "CI", "app_id": 321}],
+            }
+        }
     mod.effective_default_branch_protection = lambda token, repo: good
     return state
+
+
+def test_malformed_ruleset_strict_required_check_policy_makes_protection_indeterminate():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    state = _install_snapshot_fakes(ruleset_strict_policy="true")
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "UNKNOWN"
+        assert snap["control_outcome"] == "INDETERMINATE"
+        assert snap["completeness"]["protection"] == "partial"
+        assert state["compare_urls"] == []
+        protection_debt = next(item for item in snap["operator_debt"] if item["code"] == "protection-hold")
+        assert "strict_required_status_checks_policy" in protection_debt["detail"]
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_malformed_classic_strict_required_check_policy_makes_protection_indeterminate():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    state = _install_snapshot_fakes(classic_strict_policy="true")
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "UNKNOWN"
+        assert snap["control_outcome"] == "INDETERMINATE"
+        assert snap["completeness"]["protection"] == "partial"
+        assert state["compare_urls"] == []
+        protection_debt = next(item for item in snap["operator_debt"] if item["code"] == "protection-hold")
+        assert "classic_branch_protection.required_status_checks.strict" in protection_debt["detail"]
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
 
 
 def test_final_pr_reread_rejects_base_retarget_without_head_change():
@@ -862,6 +907,28 @@ def test_final_pr_reread_rejects_base_retarget_without_head_change():
         codes = {item["code"] for item in snap["operator_debt"]}
         assert "protected-base-hold" in codes
         assert "head-stability-hold" not in codes
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_final_base_sha_change_stales_readiness_without_strict_policy():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(final_base_sha="new-base")
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", [".github/workflows/ci.yml"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "STALE"
+        assert snap["control_outcome"] == "INDETERMINATE"
+        assert snap["base_identity_stable"] is False
+        assert snap["evidence"]["base"]["sha"] == "base"
+        assert snap["evidence"]["final_base"]["sha"] == "new-base"
+        assert snap["evidence"]["strict_required_check_synchronization"]["availability"] == "not_required"
+        codes = {item["code"] for item in snap["operator_debt"]}
+        assert "protected-base-hold" in codes
+        assert "strict-required-check-sync-hold" not in codes
+        protection_debt = next(item for item in snap["operator_debt"] if item["code"] == "protected-base-hold")
+        assert "mirrornode/example:main@base" in protection_debt["detail"]
+        assert "mirrornode/example:main@new-base" in protection_debt["detail"]
     finally:
         (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
 
@@ -931,7 +998,7 @@ def test_strict_sync_evidence_becomes_stale_if_base_sha_moves():
         assert snap["evidence"]["final_base"]["sha"] == "new-base"
         codes = {item["code"] for item in snap["operator_debt"]}
         assert "strict-required-check-sync-hold" in codes
-        assert "protected-base-hold" not in codes
+        assert "protected-base-hold" in codes
     finally:
         (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
 
