@@ -201,7 +201,15 @@ def test_rejects_ancestor_sha_approval():
 def test_accepts_exact_head_approval_only_conditionally():
     pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
     reviews = [{"state": "APPROVED", "commit_id": "new", "user": {"login": "reviewer"}}]
-    ok, errors = mod.evaluate_exact_head_approval(pr, reviews, "new", "pusher", {"reviewer": "write"}, 1)
+    ok, errors = mod.evaluate_exact_head_approval(
+        pr,
+        reviews,
+        "new",
+        "pusher",
+        {"reviewer": "write"},
+        1,
+        review_decision="APPROVED",
+    )
     assert ok and not errors
 
 
