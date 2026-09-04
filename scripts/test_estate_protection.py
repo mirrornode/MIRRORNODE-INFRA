@@ -1176,6 +1176,153 @@ def test_single_operator_update_payload_never_weakens_existing_stronger_review_p
     assert review["require_last_push_approval"] is True
 
 
+
+def test_changes_requested_authoritative_decision_blocks_exact_head_approval():
+    pr = {"head": {"sha": "head"}, "user": {"login": "author"}}
+    reviews = [
+        {
+            "id": 1,
+            "user": {"login": "reviewer"},
+            "state": "APPROVED",
+            "commit_id": "head",
+            "submitted_at": "2026-09-04T00:00:00Z",
+        }
+    ]
+    ok, errors = mod.evaluate_exact_head_approval(
+        pr,
+        reviews,
+        "head",
+        "pusher",
+        {"reviewer": {"permission": "write"}},
+        1,
+        {},
+        "CHANGES_REQUESTED",
+    )
+    assert not ok
+    assert any("CHANGES_REQUESTED" in error for error in errors)
+
+
+def test_single_operator_zero_approval_does_not_require_approved_review_decision():
+    pr = {"head": {"sha": "head"}, "user": {"login": "author"}}
+    ok, errors = mod.evaluate_exact_head_approval(
+        pr,
+        [],
+        "head",
+        "pusher",
+        {},
+        0,
+        {"required_approving_review_count": 0},
+        "REVIEW_REQUIRED",
+    )
+    assert ok, errors
+
+
+def test_external_required_check_newer_pending_run_outranks_older_completed_success():
+    required = [
+        mod._required_check_identity(
+            "external-ci",
+            producer_kind="integration",
+            producer_id=77,
+            source="ruleset:1",
+        )
+    ]
+    runs = [
+        {
+            "id": 100,
+            "name": "external-ci",
+            "head_sha": "head",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-09-04T00:00:00Z",
+            "completed_at": "2026-09-04T00:01:00Z",
+            "app": {"id": 77, "slug": "external-ci"},
+        },
+        {
+            "id": 101,
+            "name": "external-ci",
+            "head_sha": "head",
+            "status": "in_progress",
+            "conclusion": None,
+            "started_at": "2026-09-04T00:02:00Z",
+            "completed_at": None,
+            "app": {"id": 77, "slug": "external-ci"},
+        },
+    ]
+    outcome, errors = mod.evaluate_required_checks(
+        required,
+        runs,
+        [],
+        "head",
+        [],
+        [],
+    )
+    assert outcome == "UNSATISFIED"
+    assert any("status=in_progress" in error for error in errors)
+
+
+def test_bound_required_status_without_producer_receipt_is_indeterminate():
+    required = [
+        mod._required_check_identity(
+            "external-ci",
+            producer_kind="integration",
+            producer_id=77,
+            source="ruleset:1",
+        )
+    ]
+    statuses = [
+        {
+            "id": 200,
+            "context": "external-ci",
+            "sha": "head",
+            "state": "success",
+            "created_at": "2026-09-04T00:00:00Z",
+        }
+    ]
+    outcome, errors = mod.evaluate_required_checks(
+        required,
+        [],
+        statuses,
+        "head",
+        [],
+        [],
+    )
+    assert outcome == "INDETERMINATE"
+    assert any("status producer provenance unavailable" in error for error in errors)
+
+
+def test_github_successful_required_check_conclusions_include_neutral_and_skipped():
+    required = [
+        mod._required_check_identity(
+            "external-ci",
+            producer_kind="integration",
+            producer_id=77,
+            source="ruleset:1",
+        )
+    ]
+    for conclusion in ("success", "neutral", "skipped"):
+        runs = [
+            {
+                "id": 300,
+                "name": "external-ci",
+                "head_sha": "head",
+                "status": "completed",
+                "conclusion": conclusion,
+                "started_at": "2026-09-04T00:00:00Z",
+                "completed_at": "2026-09-04T00:01:00Z",
+                "app": {"id": 77, "slug": "external-ci"},
+            }
+        ]
+        outcome, errors = mod.evaluate_required_checks(
+            required,
+            runs,
+            [],
+            "head",
+            [],
+            [],
+        )
+        assert outcome == "SATISFIED", (conclusion, errors)
+
+
 def run_all():
     tests = [(name, value) for name, value in globals().items() if name.startswith("test_") and callable(value)]
     for name, test in sorted(tests):

@@ -40,6 +40,7 @@ ALLOWED_REVIEW_KEYS = RESTRICTIVE_TRUE_KEYS | {
 }
 REQUIRED_RULE_TYPES = {"deletion", "non_fast_forward", "required_linear_history"}
 REVIEW_ELIGIBLE_PERMISSIONS = {"admin", "maintain", "write"}
+SUCCESSFUL_CHECK_CONCLUSIONS = {"success", "neutral", "skipped"}
 
 
 def select_token(env: dict[str, str] | None = None) -> str:
@@ -735,6 +736,15 @@ def evaluate_exact_head_approval(
         effective_review.get("require_code_owner_review")
         or effective_review.get("required_reviewers")
     )
+    if review_decision == "CHANGES_REQUESTED":
+        errors.append("authoritative review decision is CHANGES_REQUESTED")
+    elif (
+        required_count > 0 or stronger_reviewer_constraint
+    ) and review_decision != "APPROVED":
+        errors.append(
+            "authoritative review decision is not APPROVED: "
+            f"{review_decision or 'unavailable'}"
+        )
     if stronger_reviewer_constraint and not _has_authoritative_reviewer_constraint_receipt(effective_review):
         errors.append(
             "direct authoritative code-owner/required-reviewer constraint receipt unavailable"
@@ -994,15 +1004,15 @@ def _resolve_workflow_for_check_run(
     return latest[0], None
 
 
-def _check_run_time_order(check_run: dict) -> tuple[str, str, int]:
+def _check_run_time_order(check_run: dict) -> tuple[str, int, str]:
     return (
-        check_run.get("completed_at") or "",
         check_run.get("started_at") or "",
         _int_order(check_run.get("id")),
+        check_run.get("completed_at") or "",
     )
 
 
-def _workflow_bound_check_run_order(check_run: dict, workflow_run: dict) -> tuple[int, int, int, str, str, int]:
+def _workflow_bound_check_run_order(check_run: dict, workflow_run: dict) -> tuple[int, int, int, str, int, str]:
     return (*_workflow_run_chronology(workflow_run), *_check_run_time_order(check_run))
 
 
@@ -1039,8 +1049,17 @@ def evaluate_required_checks(
             run for run in exact_runs
             if ((run.get("app") or {}).get("id")) == producer_id
         ]
+        exact_statuses = [
+            status for status in statuses
+            if status.get("context") == context
+            and status.get("sha") in (None, expected_sha)
+        ]
         if not matching:
-            if exact_runs:
+            if exact_statuses:
+                indeterminate.append(
+                    f"required check status producer provenance unavailable: {context}"
+                )
+            elif exact_runs:
                 errors.append(
                     f"required check producer mismatch: {context} expected_producer={producer_id}"
                 )
@@ -1106,7 +1125,10 @@ def evaluate_required_checks(
                 indeterminate.extend(provider_errors)
                 continue
             latest = max(matching, key=_check_run_time_order)
-        if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+        if (
+            latest.get("status") != "completed"
+            or latest.get("conclusion") not in SUCCESSFUL_CHECK_CONCLUSIONS
+        ):
             errors.append(
                 f"required check non-success: {context} "
                 f"status={latest.get('status')} conclusion={latest.get('conclusion')}"
