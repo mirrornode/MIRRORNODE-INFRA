@@ -1,0 +1,1828 @@
+#!/usr/bin/env python3
+"""Audit or monotonically strengthen MIRRORNODE default-branch protection.
+
+Read-only audit is the default. ``--apply`` may only strengthen the named
+baseline ruleset; it never treats the manifest as a replacement policy.
+All compliance decisions are fail-closed and are based on the complete
+effective default-branch protection surface that can be read.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from urllib.parse import quote
+from datetime import datetime, timezone
+from pathlib import Path
+
+API = "https://api.github.com"
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MANIFEST = ROOT / "manifests" / "estate-main-protection.v0.1.json"
+CONFIRMED_404 = {"github_api_state": "absent_404_confirmed"}
+
+RESTRICTIVE_TRUE_KEYS = {
+    "dismiss_stale_reviews_on_push",
+    "require_code_owner_review",
+    "require_last_push_approval",
+    "required_review_thread_resolution",
+    "require_extra_approval_for_unattributed_changes",
+}
+ALLOWED_REVIEW_KEYS = RESTRICTIVE_TRUE_KEYS | {
+    "required_approving_review_count",
+    "allowed_merge_methods",
+    "required_reviewers",
+}
+REQUIRED_RULE_TYPES = {"deletion", "non_fast_forward", "required_linear_history"}
+REVIEW_ELIGIBLE_PERMISSIONS = {"admin", "maintain", "write"}
+SUCCESSFUL_CHECK_CONCLUSIONS = {"success", "neutral", "skipped"}
+
+
+def select_token(env: dict[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    gh = env.get("GH_TOKEN")
+    github = env.get("GITHUB_TOKEN")
+    if gh and github and gh != github:
+        raise RuntimeError("ambiguous credentials: set exactly one of GH_TOKEN or GITHUB_TOKEN")
+    token = gh or github
+    if not token:
+        raise RuntimeError("GH_TOKEN or GITHUB_TOKEN is required")
+    return token
+
+
+def request(token: str, method: str, url: str, payload=None, allow_404: bool = False):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "mirrornode-estate-protection-v0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as exc:
+        if allow_404 and exc.code == 404:
+            return dict(CONFIRMED_404)
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitHub {method} {url} failed: {exc.code} {detail}") from exc
+
+
+def paginate(token: str, url: str) -> list[dict]:
+    out: list[dict] = []
+    page = 1
+    while True:
+        sep = "&" if "?" in url else "?"
+        batch = request(token, "GET", f"{url}{sep}per_page=100&page={page}")
+        if not isinstance(batch, list):
+            raise RuntimeError(f"expected paginated list from {url}")
+        out.extend(batch)
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
+def paginate_object_items(token: str, url: str, key: str) -> list[dict]:
+    out: list[dict] = []
+    page = 1
+    while True:
+        sep = "&" if "?" in url else "?"
+        payload = request(token, "GET", f"{url}{sep}per_page=100&page={page}")
+        batch = (payload or {}).get(key)
+        if not isinstance(batch, list):
+            raise RuntimeError(f"expected paginated {key} list from {url}")
+        out.extend(batch)
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
+def validate_manifest(manifest: dict) -> list[str]:
+    errors: list[str] = []
+    required = {
+        "version",
+        "ruleset_name",
+        "target",
+        "review_policy",
+        "required_status_checks",
+        "preserve_existing_rules",
+        "repositories",
+        "single_operator_repositories",
+    }
+    missing = sorted(required - set(manifest))
+    if missing:
+        errors.append(f"missing required fields: {', '.join(missing)}")
+    if manifest.get("target") != "~DEFAULT_BRANCH":
+        errors.append("target must be ~DEFAULT_BRANCH")
+    if manifest.get("preserve_existing_rules") is not True:
+        errors.append("preserve_existing_rules must be true")
+    repos = manifest.get("repositories")
+    if not isinstance(repos, list) or not repos or any(not isinstance(x, str) or "/" not in x for x in repos):
+        errors.append("repositories must be a non-empty owner/repo string list")
+        repos = []
+    single_operator_repos = manifest.get("single_operator_repositories")
+    if (
+        not isinstance(single_operator_repos, list)
+        or any(not isinstance(x, str) or "/" not in x for x in single_operator_repos)
+    ):
+        errors.append("single_operator_repositories must be an owner/repo string list")
+        single_operator_repos = []
+    elif len(single_operator_repos) != len(set(single_operator_repos)):
+        errors.append("single_operator_repositories must not contain duplicates")
+    outside = sorted(set(single_operator_repos) - set(repos))
+    if outside:
+        errors.append(
+            "single_operator_repositories must be a subset of repositories: "
+            + ", ".join(outside)
+        )
+    policy = manifest.get("review_policy")
+    if not isinstance(policy, dict):
+        errors.append("review_policy must be an object")
+        return errors
+    unknown = sorted(set(policy) - ALLOWED_REVIEW_KEYS)
+    if unknown:
+        errors.append(f"unsupported review policy fields: {', '.join(unknown)}")
+    if not isinstance(policy.get("required_approving_review_count"), int) or policy.get("required_approving_review_count", 0) < 1:
+        errors.append("estate default required_approving_review_count must be >= 1")
+    for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval", "required_review_thread_resolution"):
+        if policy.get(key) is not True:
+            errors.append(f"estate default {key} must be true")
+    methods = policy.get("allowed_merge_methods")
+    if not isinstance(methods, list) or not methods or any(x not in {"merge", "squash", "rebase"} for x in methods):
+        errors.append("allowed_merge_methods must be a non-empty supported list")
+    status_decl = manifest.get("required_status_checks")
+    if status_decl != {"mode": "preserve_existing_nonempty"}:
+        errors.append("required_status_checks must declare mode=preserve_existing_nonempty")
+    if manifest.get("bypass_actors", []) not in ([], None):
+        errors.append("baseline must not permit bypass actors")
+    return errors
+
+
+def review_policy_for_repo(manifest: dict, repo: str | None = None) -> dict:
+    policy = dict(manifest["review_policy"])
+    if repo and repo in (manifest.get("single_operator_repositories") or []):
+        policy["required_approving_review_count"] = 0
+        policy["require_last_push_approval"] = False
+    return policy
+
+
+def merge_restrictive_policy(existing: dict | None, floor: dict) -> dict:
+    existing = dict(existing or {})
+    unknown = set(floor) - ALLOWED_REVIEW_KEYS
+    if unknown:
+        raise ValueError(f"unknown protection parameter ordering: {sorted(unknown)}")
+    result = dict(existing)
+    for key, desired in floor.items():
+        current = existing.get(key)
+        if key == "required_approving_review_count":
+            result[key] = max(int(current or 0), int(desired))
+        elif key in RESTRICTIVE_TRUE_KEYS:
+            result[key] = bool(current) or bool(desired)
+        elif key == "allowed_merge_methods":
+            desired_set = set(desired or [])
+            current_set = set(current or [])
+            result[key] = sorted(current_set & desired_set) if current_set else sorted(desired_set)
+            if not result[key]:
+                raise ValueError("allowed_merge_methods reconciliation would remove every merge method")
+        elif key == "required_reviewers":
+            by_key = {}
+            for item in list(current or []) + list(desired or []):
+                marker = json.dumps(item, sort_keys=True)
+                by_key[marker] = item
+            result[key] = list(by_key.values())
+    result.setdefault("required_reviewers", [])
+    return result
+
+
+def desired_pull_request(existing: dict | None, policy: dict) -> dict:
+    params = merge_restrictive_policy((existing or {}).get("parameters") or {}, policy)
+    return {"type": "pull_request", "parameters": params}
+
+
+def strengthen_rules(existing_rules: list[dict], policy: dict) -> list[dict]:
+    result: list[dict] = []
+    replaced = False
+    for rule in existing_rules:
+        if rule.get("type") == "pull_request":
+            result.append(desired_pull_request(rule, policy))
+            replaced = True
+        else:
+            result.append(rule)
+    if not replaced:
+        result.append(desired_pull_request(None, policy))
+    return result
+
+
+def list_all_rulesets(token: str, repo: str) -> list[dict]:
+    summaries = paginate(token, f"{API}/repos/{repo}/rulesets")
+    details: list[dict] = []
+    for item in summaries:
+        ruleset_id = item.get("id")
+        if not ruleset_id:
+            raise RuntimeError(f"ruleset without id in {repo}")
+        details.append(request(token, "GET", f"{API}/repos/{repo}/rulesets/{ruleset_id}"))
+    return details
+
+
+
+def ref_condition_applies(ruleset: dict, default_branch: str) -> bool | None:
+    if ruleset.get("target") != "branch":
+        return False
+    cond = (ruleset.get("conditions") or {}).get("ref_name")
+    if not cond:
+        return True
+    ref = f"refs/heads/{default_branch}"
+    include = cond.get("include") or []
+    exclude = cond.get("exclude") or []
+
+    def matches(pattern: str) -> bool | None:
+        if not isinstance(pattern, str):
+            return None
+        if pattern in {"~ALL", "~DEFAULT_BRANCH"}:
+            return True
+        if any(ch in pattern for ch in "[]\\"):
+            return None
+        pieces: list[str] = []
+        index = 0
+        while index < len(pattern):
+            char = pattern[index]
+            if char == "*" and index + 1 < len(pattern) and pattern[index + 1] == "*":
+                pieces.append(".*")
+                index += 2
+            elif char == "*":
+                pieces.append("[^/]*")
+                index += 1
+            elif char == "?":
+                pieces.append("[^/]")
+                index += 1
+            else:
+                pieces.append(re.escape(char))
+                index += 1
+        return re.fullmatch("".join(pieces), ref) is not None
+
+    exclude_results = [matches(pattern) for pattern in exclude]
+    if any(result is True for result in exclude_results):
+        return False
+    if any(result is None for result in exclude_results):
+        return None
+    if not include:
+        return True
+    include_results = [matches(pattern) for pattern in include]
+    if any(result is True for result in include_results):
+        return True
+    if any(result is None for result in include_results):
+        return None
+    return False
+
+
+def _is_confirmed_404(payload) -> bool:
+    return isinstance(payload, dict) and payload.get("github_api_state") == "absent_404_confirmed"
+
+
+def _classic_bypass_visibility_diagnostics(classic: dict) -> list[str]:
+    diagnostics: list[str] = []
+    enforce_admins = classic.get("enforce_admins")
+    if not isinstance(enforce_admins, dict) or not isinstance(enforce_admins.get("enabled"), bool):
+        diagnostics.append("classic protection enforce_admins.enabled unavailable or malformed")
+
+    reviews = classic.get("required_pull_request_reviews")
+    if reviews is None:
+        return diagnostics
+    if not isinstance(reviews, dict):
+        diagnostics.append("classic required_pull_request_reviews payload malformed")
+        return diagnostics
+    if not reviews:
+        return diagnostics
+
+    allowances = reviews.get("bypass_pull_request_allowances")
+    if not isinstance(allowances, dict):
+        diagnostics.append("classic pull request bypass allowances unavailable or malformed")
+        return diagnostics
+    for actor_type in ("users", "teams", "apps"):
+        if actor_type not in allowances or not isinstance(allowances.get(actor_type), list):
+            diagnostics.append(
+                f"classic pull request bypass allowances {actor_type} unavailable or malformed"
+            )
+    return diagnostics
+
+
+def _strict_required_status_checks_policy_diagnostics(surface: dict) -> list[str]:
+    diagnostics: list[str] = []
+    for ruleset in surface.get("rulesets") or []:
+        if not isinstance(ruleset, dict):
+            continue
+        ruleset_id = ruleset.get("id")
+        for rule in ruleset.get("rules") or []:
+            if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+                continue
+            params = rule.get("parameters") or {}
+            field = "strict_required_status_checks_policy"
+            if isinstance(params, dict) and field in params and not isinstance(params.get(field), bool):
+                diagnostics.append(
+                    f"ruleset:{ruleset_id}:required_status_checks.{field} unavailable or malformed"
+                )
+    classic = surface.get("classic") or {}
+    if isinstance(classic, dict):
+        checks = classic.get("required_status_checks") or {}
+        if isinstance(checks, dict) and "strict" in checks and not isinstance(checks.get("strict"), bool):
+            diagnostics.append(
+                "classic_branch_protection.required_status_checks.strict unavailable or malformed"
+            )
+    return diagnostics
+
+
+def _mark_strict_required_status_checks_policy_completeness(surface: dict) -> dict:
+    malformed = _strict_required_status_checks_policy_diagnostics(surface)
+    if not malformed:
+        return surface
+    diagnostics = list(surface.get("diagnostics") or [])
+    for diagnostic in malformed:
+        if diagnostic not in diagnostics:
+            diagnostics.append(diagnostic)
+    surface["diagnostics"] = diagnostics
+    surface["complete"] = False
+    return surface
+
+
+def effective_default_branch_protection(token: str, repo: str) -> dict:
+    repo_info = request(token, "GET", f"{API}/repos/{repo}")
+    if not isinstance(repo_info, dict):
+        return {"complete": False, "diagnostics": ["repository metadata malformed"], "repo": repo}
+    default_branch = repo_info.get("default_branch")
+    if not default_branch:
+        return {"complete": False, "diagnostics": ["default branch unavailable"], "repo": repo}
+    diagnostics: list[str] = []
+    applicable: list[dict] = []
+    try:
+        rulesets = list_all_rulesets(token, repo)
+    except Exception as exc:
+        return {"complete": False, "diagnostics": [f"ruleset discovery unreadable: {exc}"], "repo": repo, "default_branch": default_branch}
+    for ruleset in rulesets:
+        if not isinstance(ruleset, dict):
+            diagnostics.append("ruleset detail malformed")
+            continue
+        if ruleset.get("enforcement") != "active":
+            continue
+        applies = ref_condition_applies(ruleset, default_branch)
+        if applies is None:
+            diagnostics.append(f"ruleset {ruleset.get('id')} applicability indeterminate")
+        elif applies:
+            if "bypass_actors" not in ruleset:
+                diagnostics.append(f"ruleset {ruleset.get('id')} bypass inventory unavailable")
+            applicable.append(ruleset)
+    encoded_branch = quote(default_branch, safe="")
+    classic_state = "unknown"
+    try:
+        classic = request(token, "GET", f"{API}/repos/{repo}/branches/{encoded_branch}/protection", allow_404=True)
+        if _is_confirmed_404(classic):
+            classic_state = "absent_404_confirmed"
+            classic = None
+        elif isinstance(classic, dict):
+            classic_state = "observed"
+            diagnostics.extend(_classic_bypass_visibility_diagnostics(classic))
+        elif classic is None:
+            diagnostics.append("classic protection response empty without confirmed 404")
+            classic_state = "unknown"
+        else:
+            diagnostics.append("classic protection payload malformed")
+            classic_state = "malformed"
+            classic = None
+    except Exception as exc:
+        return {
+            "complete": False,
+            "diagnostics": [f"classic protection unreadable: {exc}"],
+            "repo": repo,
+            "default_branch": default_branch,
+            "repository": repo_info,
+            "rulesets": applicable,
+            "classic": None,
+            "classic_state": "denied_or_unreadable",
+        }
+    return _mark_strict_required_status_checks_policy_completeness({
+        "complete": not diagnostics,
+        "diagnostics": diagnostics,
+        "repo": repo,
+        "default_branch": default_branch,
+        "repository": repo_info,
+        "rulesets": applicable,
+        "classic": classic,
+        "classic_state": classic_state,
+    })
+
+
+def _required_check_identity(context: str, *, producer_kind: str, producer_id, source: str, field_present: bool = True) -> dict:
+    if not field_present:
+        producer_kind = "unknown"
+        bound = None
+    else:
+        bound = producer_id is not None
+        if not bound:
+            producer_kind = "unspecified"
+    return {
+        "context": context,
+        "producer": {
+            "kind": producer_kind,
+            "id": producer_id,
+            "source": source,
+            "bound": bound,
+        },
+    }
+
+
+def _record_strict_required_status_checks_policy(
+    aggregate: dict,
+    parameters: dict,
+    field: str,
+    source: str,
+) -> None:
+    if field not in parameters:
+        return
+    value = parameters.get(field)
+    receipt = {
+        "source": source,
+        "value": value if isinstance(value, bool) else None,
+        "available": isinstance(value, bool),
+    }
+    aggregate["strict_required_status_checks_policy"]["sources"].append(receipt)
+    if value is True:
+        aggregate["strict_required_status_checks_policy"]["required"] = True
+
+
+def _aggregate_effective(surface: dict) -> dict:
+    aggregate = {
+        "rule_types": set(),
+        "review": {},
+        "status_checks": [],
+        "bypass_actors": [],
+        "strict_required_status_checks_policy": {"required": False, "sources": []},
+    }
+    repo_info = surface.get("repository") or {}
+    repo_methods = []
+    if repo_info.get("allow_squash_merge"):
+        repo_methods.append("squash")
+    if repo_info.get("allow_merge_commit"):
+        repo_methods.append("merge")
+    if repo_info.get("allow_rebase_merge"):
+        repo_methods.append("rebase")
+    if repo_methods:
+        aggregate["review"]["allowed_merge_methods"] = repo_methods
+    for ruleset in surface.get("rulesets", []):
+        aggregate["bypass_actors"].extend(ruleset.get("bypass_actors") or [])
+        ruleset_id = ruleset.get("id")
+        for rule in ruleset.get("rules", []):
+            rtype = rule.get("type")
+            aggregate["rule_types"].add(rtype)
+            params = rule.get("parameters") or {}
+            if rtype == "pull_request":
+                aggregate["review"] = merge_restrictive_policy(
+                    aggregate["review"],
+                    {k: v for k, v in params.items() if k in ALLOWED_REVIEW_KEYS},
+                )
+            elif rtype == "required_status_checks":
+                _record_strict_required_status_checks_policy(
+                    aggregate,
+                    params,
+                    "strict_required_status_checks_policy",
+                    f"ruleset:{ruleset_id}:required_status_checks.strict_required_status_checks_policy",
+                )
+                for check in params.get("required_status_checks") or []:
+                    context = check.get("context")
+                    if context:
+                        aggregate["status_checks"].append(
+                            _required_check_identity(
+                                context,
+                                producer_kind="integration",
+                                producer_id=check.get("integration_id"),
+                                source=f"ruleset:{ruleset_id}:required_status_checks.integration_id",
+                                field_present="integration_id" in check,
+                            )
+                        )
+    classic = surface.get("classic") or {}
+    if classic:
+        if classic.get("allow_deletions", {}).get("enabled") is False:
+            aggregate["rule_types"].add("deletion")
+        if classic.get("allow_force_pushes", {}).get("enabled") is False:
+            aggregate["rule_types"].add("non_fast_forward")
+        if classic.get("required_linear_history", {}).get("enabled") is True:
+            aggregate["rule_types"].add("required_linear_history")
+        reviews = classic.get("required_pull_request_reviews") or {}
+        if reviews:
+            classic_policy = {
+                "required_approving_review_count": reviews.get("required_approving_review_count", 0),
+                "dismiss_stale_reviews_on_push": reviews.get("dismiss_stale_reviews", False),
+                "require_code_owner_review": reviews.get("require_code_owner_reviews", False),
+                "require_last_push_approval": reviews.get("require_last_push_approval", False),
+                "required_review_thread_resolution": (classic.get("required_conversation_resolution") or {}).get("enabled", False),
+            }
+            aggregate["review"] = merge_restrictive_policy(aggregate["review"], classic_policy)
+        enforce_admins = classic.get("enforce_admins")
+        if isinstance(enforce_admins, dict) and enforce_admins.get("enabled") is not True:
+            aggregate["bypass_actors"].append(
+                {
+                    "kind": "classic_admin_bypass",
+                    "enabled": enforce_admins.get("enabled"),
+                    "source": "classic_branch_protection.enforce_admins.enabled",
+                }
+            )
+        allowances = reviews.get("bypass_pull_request_allowances") or {}
+        for actor_type in ("users", "teams", "apps"):
+            actors = allowances.get(actor_type) or []
+            if actors:
+                aggregate["bypass_actors"].append(
+                    {
+                        "kind": "classic_pull_request_bypass",
+                        "actor_type": actor_type,
+                        "actors": actors,
+                        "source": (
+                            "classic_branch_protection.required_pull_request_reviews."
+                            f"bypass_pull_request_allowances.{actor_type}"
+                        ),
+                    }
+                )
+        checks = classic.get("required_status_checks") or {}
+        if checks:
+            _record_strict_required_status_checks_policy(
+                aggregate,
+                checks,
+                "strict",
+                "classic_branch_protection.required_status_checks.strict",
+            )
+        for check in checks.get("checks") or []:
+            context = check.get("context")
+            if context:
+                aggregate["status_checks"].append(
+                    _required_check_identity(
+                        context,
+                        producer_kind="github_app",
+                        producer_id=check.get("app_id"),
+                        source="classic_branch_protection.required_status_checks.checks[].app_id",
+                        field_present="app_id" in check,
+                    )
+                )
+    return aggregate
+
+def validate_effective_protection(surface: dict, manifest: dict, repo: str | None = None) -> tuple[bool, list[str]]:
+    surface = _mark_strict_required_status_checks_policy_completeness(surface)
+    diagnostics = list(surface.get("diagnostics") or [])
+    if not surface.get("complete"):
+        diagnostics.append("effective protection surface incomplete")
+        return False, diagnostics
+    aggregate = _aggregate_effective(surface)
+    missing_rules = REQUIRED_RULE_TYPES - aggregate["rule_types"]
+    if missing_rules:
+        diagnostics.append(f"missing required rules: {', '.join(sorted(missing_rules))}")
+    if aggregate["bypass_actors"]:
+        diagnostics.append("effective bypass actor present")
+    if manifest.get("required_status_checks") == {"mode": "preserve_existing_nonempty"} and not aggregate["status_checks"]:
+        diagnostics.append("no effective required status check")
+    policy = review_policy_for_repo(manifest, repo)
+    observed = aggregate["review"]
+    if int(observed.get("required_approving_review_count") or 0) < int(policy["required_approving_review_count"]):
+        diagnostics.append("approval count below manifest floor")
+    for key in RESTRICTIVE_TRUE_KEYS:
+        if policy.get(key) is True and observed.get(key) is not True:
+            diagnostics.append(f"{key} not effectively enforced")
+    desired_methods = set(policy.get("allowed_merge_methods") or [])
+    observed_methods = set(observed.get("allowed_merge_methods") or [])
+    if not observed_methods or not observed_methods.issubset(desired_methods):
+        diagnostics.append("effective merge methods exceed manifest restriction")
+    return not diagnostics, diagnostics
+
+
+def find_named_ruleset(rulesets: list[dict], name: str) -> dict | None:
+    matches = [r for r in rulesets if r.get("name") == name]
+    if len(matches) > 1:
+        raise RuntimeError(f"duplicate named rulesets found: {name}")
+    return matches[0] if matches else None
+
+
+def create_payload(manifest: dict, repo: str | None = None) -> dict:
+    return {
+        "name": manifest["ruleset_name"],
+        "target": "branch",
+        "enforcement": "active",
+        "conditions": {"ref_name": {"include": [manifest["target"]], "exclude": []}},
+        "rules": [
+            {"type": "deletion"},
+            {"type": "non_fast_forward"},
+            {"type": "required_linear_history"},
+            desired_pull_request(None, review_policy_for_repo(manifest, repo)),
+        ],
+        "bypass_actors": [],
+    }
+
+
+def update_payload(ruleset: dict, manifest: dict, repo: str | None = None) -> dict:
+    if ruleset.get("bypass_actors"):
+        raise RuntimeError("named ruleset contains bypass actors; refusing mutation")
+    return {
+        "name": ruleset["name"],
+        "target": ruleset["target"],
+        "enforcement": "active",
+        "conditions": ruleset["conditions"],
+        "rules": strengthen_rules(
+            ruleset.get("rules", []),
+            review_policy_for_repo(manifest, repo),
+        ),
+        "bypass_actors": [],
+    }
+
+
+def latest_reviews_by_reviewer(reviews: list[dict]) -> dict[str, dict]:
+    """Return each reviewer's latest submitted state, not their best historical state."""
+    latest: dict[str, dict] = {}
+    for review in reviews:
+        reviewer = ((review.get("user") or {}).get("login") or "").lower()
+        if not reviewer:
+            continue
+        marker = (review.get("submitted_at") or "", int(review.get("id") or 0))
+        current = latest.get(reviewer)
+        current_marker = (current.get("submitted_at") or "", int(current.get("id") or 0)) if current else ("", 0)
+        if current is None or marker > current_marker:
+            latest[reviewer] = review
+    return latest
+
+
+
+def read_reviewer_permissions(token: str, repo: str, reviews: list[dict]) -> tuple[dict[str, dict], list[str]]:
+    permissions: dict[str, dict] = {}
+    errors: list[str] = []
+    reviewers = sorted({((r.get("user") or {}).get("login") or "").lower() for r in reviews} - {""})
+    collected_at = datetime.now(timezone.utc).isoformat()
+    for reviewer in reviewers:
+        try:
+            payload = request(token, "GET", f"{API}/repos/{repo}/collaborators/{reviewer}/permission")
+            permission = (payload or {}).get("permission")
+            if permission:
+                permissions[reviewer] = {
+                    "repository": repo,
+                    "reviewer": reviewer,
+                    "permission": permission,
+                    "source": "repos/{repo}/collaborators/{username}/permission",
+                    "collected_at": collected_at,
+                    "inheritance": "unknown",
+                }
+            else:
+                errors.append(f"reviewer permission unavailable: {reviewer}")
+        except Exception as exc:
+            errors.append(f"reviewer permission unreadable: {reviewer}: {exc}")
+    return permissions, errors
+
+
+def _permission_value(value) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("permission")
+    return None
+
+
+def _has_authoritative_reviewer_constraint_receipt(effective_review: dict) -> bool:
+    receipt = effective_review.get("strong_reviewer_constraint_receipt")
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("state") == "satisfied"
+        and bool(receipt.get("source"))
+    )
+
+
+def evaluate_exact_head_approval(
+    pr: dict,
+    reviews: list[dict],
+    expected_sha: str,
+    latest_push_actor: str | None,
+    reviewer_permissions: dict,
+    required_count: int,
+    effective_review: dict | None = None,
+    review_decision: str | None = None,
+) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    current = ((pr.get("head") or {}).get("sha"))
+    if current != expected_sha:
+        return False, [f"PR head mismatch: current={current} expected={expected_sha}"]
+    if not latest_push_actor:
+        errors.append("observed latest push actor provenance unavailable")
+    author = (((pr.get("user") or {}).get("login")) or "").lower()
+    pusher = (latest_push_actor or "").lower()
+    eligible: set[str] = set()
+    for reviewer, review in latest_reviews_by_reviewer(reviews).items():
+        if review.get("state") != "APPROVED":
+            continue
+        if review.get("commit_id") != expected_sha:
+            continue
+        if reviewer == author or reviewer == pusher:
+            continue
+        if _permission_value(reviewer_permissions.get(reviewer)) not in REVIEW_ELIGIBLE_PERMISSIONS:
+            continue
+        eligible.add(reviewer)
+    if len(eligible) < required_count:
+        errors.append(
+            f"eligible exact-head approvals below effective requirement: "
+            f"observed={len(eligible)} required={required_count}"
+        )
+    effective_review = effective_review or {}
+    stronger_reviewer_constraint = bool(
+        effective_review.get("require_code_owner_review")
+        or effective_review.get("required_reviewers")
+    )
+    if review_decision == "CHANGES_REQUESTED":
+        errors.append("authoritative review decision is CHANGES_REQUESTED")
+    elif (
+        required_count > 0 or stronger_reviewer_constraint
+    ) and review_decision != "APPROVED":
+        errors.append(
+            "authoritative review decision is not APPROVED: "
+            f"{review_decision or 'unavailable'}"
+        )
+    if stronger_reviewer_constraint and not _has_authoritative_reviewer_constraint_receipt(effective_review):
+        errors.append(
+            "direct authoritative code-owner/required-reviewer constraint receipt unavailable"
+        )
+    return not errors, errors
+
+
+def read_review_gate_state(token: str, repo: str, pr_number: int) -> dict:
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          reviewDecision
+          reviewThreads(first: 100, after: $cursor) {
+            nodes { id isResolved isOutdated }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }
+    """
+    cursor = None
+    threads: list[dict] = []
+    review_decision = None
+    while True:
+        payload = request(
+            token,
+            "POST",
+            f"{API}/graphql",
+            {
+                "query": query,
+                "variables": {"owner": owner, "name": name, "number": pr_number, "cursor": cursor},
+            },
+        )
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise RuntimeError(f"review thread GraphQL response invalid: {(payload or {}).get('errors')}")
+        pull = (((payload.get("data") or {}).get("repository") or {}).get("pullRequest"))
+        if not isinstance(pull, dict):
+            raise RuntimeError("pull request review state unavailable")
+        if review_decision is None:
+            review_decision = pull.get("reviewDecision")
+        connection = pull.get("reviewThreads") or {}
+        nodes = connection.get("nodes")
+        page_info = connection.get("pageInfo") or {}
+        if not isinstance(nodes, list) or "hasNextPage" not in page_info:
+            raise RuntimeError("review thread pagination schema unavailable")
+        for node in nodes:
+            if not isinstance(node, dict) or not node.get("id") or "isResolved" not in node:
+                raise RuntimeError("review thread node malformed")
+            threads.append(
+                {
+                    "id": node.get("id"),
+                    "is_resolved": bool(node.get("isResolved")),
+                    "is_outdated": bool(node.get("isOutdated")),
+                }
+            )
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            raise RuntimeError("review thread pagination cursor missing")
+    return {
+        "collection_state": "complete",
+        "review_decision": review_decision,
+        "total_discovered": len(threads),
+        "unresolved_current": sum(1 for t in threads if not t["is_resolved"] and not t["is_outdated"]),
+        "unresolved_outdated": sum(1 for t in threads if not t["is_resolved"] and t["is_outdated"]),
+        "threads": threads,
+    }
+
+
+def read_latest_push_evidence(token: str, repo: str, pr: dict, expected_sha: str) -> dict:
+    head = pr.get("head") or {}
+    head_repo = ((head.get("repo") or {}).get("full_name"))
+    if not head_repo:
+        raise RuntimeError("PR head repository unavailable for push provenance")
+    head_ref = head.get("ref")
+    if not head_ref:
+        raise RuntimeError("PR head ref unavailable for push provenance")
+    target_ref = f"refs/heads/{head_ref}"
+    events = paginate(token, f"{API}/repos/{head_repo}/events")
+    matches = []
+    for event in events:
+        if event.get("type") != "PushEvent":
+            continue
+        event_payload = event.get("payload") or {}
+        resulting_sha = event_payload.get("head") or event_payload.get("after")
+        if event_payload.get("ref") == target_ref and resulting_sha == expected_sha:
+            actor = ((event.get("actor") or {}).get("login") or "").lower()
+            if actor:
+                matches.append(
+                    {
+                        "event_id": event.get("id"),
+                        "repository": head_repo,
+                        "ref": target_ref,
+                        "resulting_head_sha": resulting_sha,
+                        "event_type": "PushEvent",
+                        "actor": actor,
+                        "event_timestamp": event.get("created_at"),
+                    }
+                )
+    actors = {item["actor"] for item in matches}
+    if not matches:
+        raise RuntimeError("observed PushEvent provenance for exact PR head not found")
+    if len(actors) != 1:
+        raise RuntimeError(f"ambiguous observed PushEvent actors for exact PR head: {sorted(actors)}")
+    receipt_bytes = json.dumps(matches, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        **max(matches, key=lambda item: (item.get("event_timestamp") or "", item.get("event_id") or "")),
+        "availability": "observed",
+        "authority": "repository_events_observed_not_fully_authoritative",
+        "source_receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+    }
+
+
+def read_required_check_evidence(token: str, repo: str, expected_sha: str) -> dict:
+    check_runs = paginate_object_items(
+        token,
+        f"{API}/repos/{repo}/commits/{expected_sha}/check-runs?filter=all",
+        "check_runs",
+    )
+    statuses = paginate(token, f"{API}/repos/{repo}/commits/{expected_sha}/statuses")
+    return {"check_runs": check_runs, "statuses": statuses}
+
+
+def _int_order(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_suite_id(check_run: dict):
+    suite = check_run.get("check_suite") or {}
+    return suite.get("id") or check_run.get("check_suite_id")
+
+
+def _workflow_run_matches_required(workflow_run: dict, required_workflows: list[str]) -> bool:
+    if not required_workflows:
+        return True
+    identifiers = {
+        str(workflow_run.get("name") or ""),
+        str(workflow_run.get("path") or ""),
+        str(workflow_run.get("workflow_id") or ""),
+    }
+    return any(str(required) in identifiers for required in required_workflows)
+
+
+def _trusted_workflow_selector(required_workflow: str) -> dict | None:
+    raw = str(required_workflow or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("path:"):
+        path = raw[len("path:"):].strip()
+        return {"kind": "path", "value": path, "raw": raw} if path else None
+    if raw.startswith("id:"):
+        workflow_id = raw[len("id:"):].strip()
+        return {"kind": "id", "value": workflow_id, "raw": raw} if workflow_id.isdigit() else None
+    if raw.startswith(".github/workflows/"):
+        return {"kind": "path", "value": raw, "raw": raw}
+    if raw.isdigit():
+        return {"kind": "id", "value": raw, "raw": raw}
+    return None
+
+
+def _trusted_workflow_selectors(required_workflows: list[str]) -> tuple[list[dict], list[str]]:
+    selectors: list[dict] = []
+    errors: list[str] = []
+    if not required_workflows:
+        errors.append("trusted workflow identity unavailable: no required workflow path or id supplied")
+        return selectors, errors
+    for required in required_workflows:
+        selector = _trusted_workflow_selector(required)
+        if selector is None:
+            errors.append(f"trusted workflow identity unavailable: {required}")
+        else:
+            selectors.append(selector)
+    return selectors, errors
+
+
+def _workflow_run_matches_trusted_selector(workflow_run: dict, selector: dict) -> bool:
+    if selector.get("kind") == "path":
+        return str(workflow_run.get("path") or "") == selector.get("value")
+    if selector.get("kind") == "id":
+        return str(workflow_run.get("workflow_id") or "") == selector.get("value")
+    return False
+
+
+def _workflow_run_matches_trusted_requirement(workflow_run: dict, selectors: list[dict]) -> bool:
+    return any(_workflow_run_matches_trusted_selector(workflow_run, selector) for selector in selectors)
+
+
+def _github_actions_identity(app: dict) -> bool | None:
+    if not isinstance(app, dict):
+        return None
+    observed = [
+        str(app.get("slug") or "").lower(),
+        str(app.get("name") or "").lower(),
+    ]
+    if "github-actions" in observed or "github actions" in observed:
+        return True
+    if app.get("id") is None and not any(observed):
+        return None
+    if any(observed):
+        return False
+    return None
+
+
+def _workflow_run_chronology(workflow_run: dict) -> tuple[int, int, int]:
+    return (
+        _int_order(workflow_run.get("run_number")),
+        _int_order(workflow_run.get("id")),
+        _int_order(workflow_run.get("run_attempt")),
+    )
+
+
+def _resolve_workflow_for_check_run(
+    check_run: dict,
+    workflow_runs: list[dict],
+    expected_sha: str,
+    required_workflows: list[str],
+) -> tuple[dict | None, str | None]:
+    context = check_run.get("name")
+    selectors, selector_errors = _trusted_workflow_selectors(required_workflows)
+    if selector_errors:
+        return None, (
+            f"workflow provenance unavailable for required check: {context}; "
+            + "; ".join(selector_errors)
+        )
+    suite_id = _check_suite_id(check_run)
+    if suite_id is None:
+        return None, f"check suite provenance unavailable for required check: {context}"
+    candidates = [
+        run for run in workflow_runs
+        if run.get("check_suite_id") == suite_id
+        and run.get("head_sha") == expected_sha
+        and run.get("event") == "pull_request"
+        and _workflow_run_matches_trusted_requirement(run, selectors)
+    ]
+    if not candidates:
+        return None, f"workflow provenance unavailable for required check: {context}"
+    for run in candidates:
+        missing = [
+            field for field in ("id", "workflow_id", "path", "run_number", "run_attempt")
+            if run.get(field) is None
+        ]
+        if missing:
+            return None, (
+                f"workflow provenance incomplete for required check: {context} "
+                f"missing={','.join(missing)}"
+            )
+    latest_key = max(_workflow_run_chronology(run) for run in candidates)
+    latest = [run for run in candidates if _workflow_run_chronology(run) == latest_key]
+    if len(latest) != 1:
+        return None, f"workflow provenance ambiguous for required check: {context}"
+    return latest[0], None
+
+
+def _check_run_time_order(check_run: dict) -> tuple[str, int, str]:
+    return (
+        check_run.get("started_at") or "",
+        _int_order(check_run.get("id")),
+        check_run.get("completed_at") or "",
+    )
+
+
+def _workflow_bound_check_run_order(check_run: dict, workflow_run: dict) -> tuple[int, int, int, str, int, str]:
+    return (*_workflow_run_chronology(workflow_run), *_check_run_time_order(check_run))
+
+
+def evaluate_required_checks(
+    required_checks: list[dict],
+    check_runs: list[dict],
+    statuses: list[dict],
+    expected_sha: str,
+    workflow_runs: list[dict] | None = None,
+    required_workflows: list[str] | None = None,
+) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    indeterminate: list[str] = []
+    required_workflows = required_workflows or []
+    for required in required_checks:
+        context = required.get("context")
+        producer = required.get("producer") or {}
+        bound = producer.get("bound")
+        producer_id = producer.get("id")
+        if not context:
+            indeterminate.append("required check context unavailable")
+            continue
+        if bound is None:
+            indeterminate.append(f"required check producer visibility unavailable: {context}")
+            continue
+        if bound is not True:
+            indeterminate.append(f"required check producer unbound for context-only evidence: {context}")
+            continue
+        exact_runs = [
+            run for run in check_runs
+            if run.get("name") == context and run.get("head_sha") == expected_sha
+        ]
+        matching = [
+            run for run in exact_runs
+            if ((run.get("app") or {}).get("id")) == producer_id
+        ]
+        exact_statuses = [
+            status for status in statuses
+            if status.get("context") == context
+            and status.get("sha") in (None, expected_sha)
+        ]
+        if not matching:
+            if exact_statuses:
+                indeterminate.append(
+                    f"required check status producer provenance unavailable: {context}"
+                )
+            elif exact_runs:
+                errors.append(
+                    f"required check producer mismatch: {context} expected_producer={producer_id}"
+                )
+            else:
+                errors.append(f"required check missing: {context}")
+            continue
+        if workflow_runs is not None:
+            workflow_bound: list[tuple[dict, dict]] = []
+            external_runs: list[dict] = []
+            provider_errors: list[str] = []
+            for run in matching:
+                workflow_run, mapping_error = _resolve_workflow_for_check_run(
+                    run, workflow_runs, expected_sha, required_workflows
+                )
+                if workflow_run is not None:
+                    workflow_bound.append((run, workflow_run))
+                    continue
+                github_actions = _github_actions_identity(run.get("app") or {})
+                if github_actions is False:
+                    external_runs.append(run)
+                    continue
+                if github_actions is True:
+                    provider_errors.append(
+                        mapping_error or f"workflow provenance unavailable for required check: {context}"
+                    )
+                else:
+                    provider_errors.append(
+                        "required check provider identity unavailable and "
+                        + (mapping_error or f"workflow provenance unavailable for required check: {context}")
+                    )
+            if workflow_bound and external_runs:
+                provider_errors.append(f"required check provider provenance ambiguous: {context}")
+            if provider_errors:
+                indeterminate.extend(provider_errors)
+                continue
+            if workflow_bound:
+                latest_key = max(
+                    _workflow_bound_check_run_order(run, workflow)
+                    for run, workflow in workflow_bound
+                )
+                latest_pairs = [
+                    (run, workflow)
+                    for run, workflow in workflow_bound
+                    if _workflow_bound_check_run_order(run, workflow) == latest_key
+                ]
+                if len(latest_pairs) != 1:
+                    indeterminate.append(f"required check chronology ambiguous: {context}")
+                    continue
+                latest = latest_pairs[0][0]
+            elif external_runs:
+                latest = max(external_runs, key=_check_run_time_order)
+            else:
+                indeterminate.append(f"required check provider provenance unavailable: {context}")
+                continue
+        else:
+            provider_errors = []
+            for run in matching:
+                if _github_actions_identity(run.get("app") or {}) is None:
+                    provider_errors.append(f"required check provider identity unavailable: {context}")
+                elif _github_actions_identity(run.get("app") or {}) is True:
+                    provider_errors.append(f"workflow provenance unavailable for required check: {context}")
+            if provider_errors:
+                indeterminate.extend(provider_errors)
+                continue
+            latest = max(matching, key=_check_run_time_order)
+        if (
+            latest.get("status") != "completed"
+            or latest.get("conclusion") not in SUCCESSFUL_CHECK_CONCLUSIONS
+        ):
+            errors.append(
+                f"required check non-success: {context} "
+                f"status={latest.get('status')} conclusion={latest.get('conclusion')}"
+            )
+    if errors:
+        return "UNSATISFIED", errors + indeterminate
+    if indeterminate:
+        return "INDETERMINATE", indeterminate
+    return "SATISFIED", []
+
+
+def read_exact_head_approval(token: str, repo: str, pr_number: int, expected_sha: str) -> tuple[bool, list[str]]:
+    pr = request(token, "GET", f"{API}/repos/{repo}/pulls/{pr_number}")
+    reviews = paginate(token, f"{API}/repos/{repo}/pulls/{pr_number}/reviews")
+    permissions, permission_errors = read_reviewer_permissions(token, repo, reviews)
+    try:
+        push = read_latest_push_evidence(token, repo, pr, expected_sha)
+        latest_actor = push.get("actor")
+        push_errors: list[str] = []
+    except Exception as exc:
+        latest_actor = None
+        push_errors = [str(exc)]
+    ok, errors = evaluate_exact_head_approval(pr, reviews, expected_sha, latest_actor, permissions, 1)
+    all_errors = permission_errors + push_errors + errors
+    return ok and not all_errors, all_errors
+
+
+def evaluate_latest_runs(
+    runs: list[dict],
+    required_workflows: list[str],
+    expected_sha: str | None = None,
+) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    if expected_sha is None:
+        requirements = [{"raw": name, "candidates": [r for r in runs if r.get("name") == name]} for name in required_workflows]
+    else:
+        selectors, selector_errors = _trusted_workflow_selectors(required_workflows)
+        errors.extend(selector_errors)
+        requirements = [
+            {
+                "raw": selector["raw"],
+                "candidates": [
+                    r for r in runs
+                    if _workflow_run_matches_trusted_selector(r, selector)
+                ],
+            }
+            for selector in selectors
+        ]
+    for requirement in requirements:
+        name = requirement["raw"]
+        candidates = requirement["candidates"]
+        if not candidates:
+            errors.append(f"required workflow missing: {name}")
+            continue
+        if expected_sha is not None:
+            wrong_scope = [
+                r for r in candidates
+                if r.get("head_sha") != expected_sha or r.get("event") != "pull_request"
+            ]
+            if wrong_scope:
+                errors.append(f"workflow scope mismatch for {name}")
+                continue
+            identities = {
+                (r.get("workflow_id"), r.get("path"))
+                for r in candidates
+            }
+            if any(workflow_id is None or path is None for workflow_id, path in identities):
+                errors.append(f"workflow identity unavailable: {name}")
+                continue
+            if len(identities) != 1:
+                errors.append(f"workflow identity ambiguous: {name}")
+                continue
+        latest = max(
+            candidates,
+            key=lambda r: (
+                int(r.get("run_number") or 0),
+                int(r.get("id") or 0),
+                int(r.get("run_attempt") or 1),
+                r.get("created_at") or "",
+            ),
+        )
+        if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+            errors.append(
+                f"latest workflow non-success: {name} "
+                f"status={latest.get('status')} conclusion={latest.get('conclusion')}"
+            )
+    return not errors, errors
+
+
+def latest_run_status(token: str, repo: str, sha: str, required_workflows: list[str]) -> tuple[bool, list[str]]:
+    runs = paginate_object_items(token, f"{API}/repos/{repo}/actions/runs?head_sha={sha}&event=pull_request", "workflow_runs")
+    return evaluate_latest_runs(runs, required_workflows, sha)
+
+
+def _pr_base_binding(pr: dict) -> dict:
+    base = pr.get("base") or {}
+    return {
+        "repository": ((base.get("repo") or {}).get("full_name") or ""),
+        "ref": base.get("ref"),
+        "sha": base.get("sha"),
+    }
+
+
+def _repo_key(repository: str | None) -> str:
+    return str(repository or "").lower()
+
+
+def _base_identity(base: dict) -> tuple[str, str | None, str | None]:
+    return (_repo_key(base.get("repository")), base.get("ref"), base.get("sha"))
+
+
+def _compare_endpoint(repo: str, base_sha: str | None, expected_sha: str) -> str | None:
+    if not base_sha:
+        return None
+    return (
+        f"{API}/repos/{repo}/compare/"
+        f"{quote(str(base_sha), safe='')}...{quote(str(expected_sha), safe='')}"
+    )
+
+
+def _strict_sync_evidence_template(repo: str, base: dict, expected_sha: str, *, required: bool) -> dict:
+    return {
+        "required": required,
+        "availability": "not_required" if not required else "unavailable",
+        "repository": repo,
+        "base_repository": base.get("repository"),
+        "base_ref": base.get("ref"),
+        "base_sha": base.get("sha"),
+        "expected_head_sha": expected_sha,
+        "behind_by": None,
+        "source_endpoint": _compare_endpoint(repo, base.get("sha"), expected_sha),
+    }
+
+
+def read_strict_required_check_synchronization(token: str, repo: str, base: dict, expected_sha: str) -> dict:
+    evidence = _strict_sync_evidence_template(repo, base, expected_sha, required=True)
+    base_sha = base.get("sha")
+    if not base_sha:
+        raise RuntimeError("PR base sha unavailable for strict required-check synchronization")
+    endpoint = evidence["source_endpoint"]
+    payload = request(token, "GET", endpoint)
+    if not isinstance(payload, dict) or not isinstance(payload.get("behind_by"), int):
+        raise RuntimeError("strict required-check synchronization comparison malformed")
+    evidence.update(
+        {
+            "availability": "observed",
+            "behind_by": payload.get("behind_by"),
+        }
+    )
+    return evidence
+
+
+def _operator_debt(code: str, subject: str, detail: str, evidence: list[dict]) -> dict:
+    return {
+        "id": "github-ops:" + subject + ":" + code,
+        "code": code,
+        "subject": subject,
+        "severity": "blocking",
+        "detail": detail,
+        "evidence": evidence,
+        "resolution": "collect fresh complete evidence satisfying the named gate",
+    }
+
+
+
+def build_read_only_snapshot(
+    token: str,
+    repo: str,
+    pr_number: int,
+    expected_sha: str,
+    required_workflows: list[str],
+    manifest: dict,
+    *,
+    trusted_latest_push_actor: str | None = None,
+) -> dict:
+    """Collect one immutable-input, read-only GitHub Ops projection."""
+    collected_at = datetime.now(timezone.utc).isoformat()
+    policy_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    policy_sha256 = hashlib.sha256(policy_bytes).hexdigest()
+    governed_repo_ok = repo in (manifest.get("repositories") or [])
+
+    pr = request(token, "GET", API + "/repos/" + repo + "/pulls/" + str(pr_number))
+    initial_base = _pr_base_binding(pr)
+    reviews = paginate(token, API + "/repos/" + repo + "/pulls/" + str(pr_number) + "/reviews")
+    reviewer_permissions, permission_errors = read_reviewer_permissions(token, repo, reviews)
+
+    unknown_reasons: list[str] = list(permission_errors)
+    try:
+        review_gate = read_review_gate_state(token, repo, pr_number)
+        review_gate_error = None
+    except Exception as exc:
+        review_gate = {
+            "collection_state": "unknown",
+            "review_decision": None,
+            "total_discovered": None,
+            "unresolved_current": None,
+            "unresolved_outdated": None,
+            "threads": [],
+        }
+        review_gate_error = str(exc)
+        unknown_reasons.append("review thread evidence unavailable: " + review_gate_error)
+
+    try:
+        push_evidence = read_latest_push_evidence(token, repo, pr, expected_sha)
+        observed_push_event_provenance = push_evidence
+        push_error = None
+    except Exception as exc:
+        push_evidence = None
+        push_error = str(exc)
+        observed_push_event_provenance = {
+            "availability": "unavailable",
+            "authority": "repository_events_observed_not_fully_authoritative",
+            "error": push_error,
+        }
+        unknown_reasons.append("latest push provenance unavailable: " + push_error)
+
+    if trusted_latest_push_actor and push_evidence:
+        if trusted_latest_push_actor.lower() != (push_evidence.get("actor") or "").lower():
+            unknown_reasons.append(
+                "caller-supplied latest push actor conflicts with observed GitHub push provenance"
+            )
+
+    try:
+        runs = paginate_object_items(
+            token,
+            API + "/repos/" + repo + "/actions/runs?head_sha=" + expected_sha + "&event=pull_request",
+            "workflow_runs",
+        )
+        workflow_collection_error = None
+    except Exception as exc:
+        runs = []
+        workflow_collection_error = str(exc)
+        unknown_reasons.append("workflow evidence unavailable: " + workflow_collection_error)
+
+    protection = _mark_strict_required_status_checks_policy_completeness(
+        effective_default_branch_protection(token, repo)
+    )
+    aggregate = (
+        _aggregate_effective(protection)
+        if protection.get("complete")
+        else {
+            "review": {},
+            "status_checks": [],
+            "rule_types": set(),
+            "bypass_actors": [],
+            "strict_required_status_checks_policy": {"required": False, "sources": []},
+        }
+    )
+    if not protection.get("complete"):
+        unknown_reasons.extend(protection.get("diagnostics") or ["protection evidence incomplete"])
+
+    expected_base_ref = protection.get("default_branch")
+    initial_base_ok = (
+        bool(expected_base_ref)
+        and _repo_key(initial_base.get("repository")) == repo.lower()
+        and initial_base.get("ref") == expected_base_ref
+    )
+    initial_base_errors = [] if initial_base_ok else [
+        f"initial PR base is not the protected repository default branch: "
+        f"observed={_repo_key(initial_base.get('repository'))}:{initial_base.get('ref')} "
+        f"expected={repo.lower()}:{expected_base_ref}"
+    ]
+
+    strict_policy = aggregate.get("strict_required_status_checks_policy") or {
+        "required": False,
+        "sources": [],
+    }
+    strict_sync_required = bool(strict_policy.get("required"))
+    strict_sync_evidence = _strict_sync_evidence_template(
+        repo, initial_base, expected_sha, required=strict_sync_required
+    )
+    strict_sync_collection_error = None
+    strict_sync_outcome = "SATISFIED"
+    strict_sync_errors: list[str] = []
+    if strict_sync_required:
+        try:
+            strict_sync_evidence = read_strict_required_check_synchronization(
+                token, repo, initial_base, expected_sha
+            )
+            if strict_sync_evidence.get("behind_by") == 0:
+                strict_sync_outcome = "SATISFIED"
+            else:
+                strict_sync_outcome = "UNSATISFIED"
+                strict_sync_errors.append(
+                    "strict required-check synchronization unsatisfied: "
+                    f"behind_by={strict_sync_evidence.get('behind_by')}"
+                )
+        except Exception as exc:
+            strict_sync_collection_error = str(exc)
+            strict_sync_outcome = "INDETERMINATE"
+            strict_sync_errors.append(
+                "strict required-check synchronization evidence unavailable: "
+                + strict_sync_collection_error
+            )
+            strict_sync_evidence["error"] = strict_sync_collection_error
+            unknown_reasons.extend(strict_sync_errors)
+
+    try:
+        check_evidence = read_required_check_evidence(token, repo, expected_sha)
+        check_collection_error = None
+    except Exception as exc:
+        check_evidence = {"check_runs": [], "statuses": []}
+        check_collection_error = str(exc)
+        unknown_reasons.append("required-check evidence unavailable: " + check_collection_error)
+
+    required_count = int((aggregate.get("review") or {}).get("required_approving_review_count") or 0)
+    observed_push_actor = (push_evidence or {}).get("actor")
+    approval_ok, approval_errors = evaluate_exact_head_approval(
+        pr,
+        reviews,
+        expected_sha,
+        observed_push_actor,
+        reviewer_permissions,
+        required_count,
+        aggregate.get("review") or {},
+        review_gate.get("review_decision"),
+    )
+    approval_indeterminate_errors = [
+        error for error in approval_errors
+        if "constraint receipt unavailable" in error
+    ]
+    unknown_reasons.extend(approval_indeterminate_errors)
+    if permission_errors or push_error or review_gate_error or approval_indeterminate_errors:
+        approval_ok = False
+
+    if workflow_collection_error:
+        workflow_ok = False
+        workflow_errors = ["workflow evidence collection incomplete"]
+    else:
+        workflow_ok, workflow_errors = evaluate_latest_runs(runs, required_workflows, expected_sha)
+
+    protection_ok, protection_errors = validate_effective_protection(protection, manifest, repo)
+
+    if check_collection_error or not protection.get("complete") or workflow_collection_error:
+        check_outcome = "INDETERMINATE"
+        check_errors = ["required-check evaluation lacks complete protection/check/workflow evidence"]
+    else:
+        check_outcome, check_errors = evaluate_required_checks(
+            aggregate.get("status_checks") or [],
+            check_evidence.get("check_runs") or [],
+            check_evidence.get("statuses") or [],
+            expected_sha,
+            runs,
+            required_workflows,
+        )
+        if check_outcome == "INDETERMINATE":
+            unknown_reasons.extend(check_errors)
+
+    thread_errors: list[str] = []
+    threads_ok = review_gate_error is None
+    if threads_ok:
+        if int(review_gate.get("unresolved_current") or 0) > 0:
+            threads_ok = False
+            thread_errors.append(
+                f"unresolved current review threads: {review_gate.get('unresolved_current')}"
+            )
+        if int(review_gate.get("unresolved_outdated") or 0) > 0:
+            threads_ok = False
+            thread_errors.append(
+                f"unresolved outdated review threads require classification: "
+                f"{review_gate.get('unresolved_outdated')}"
+            )
+
+    final_pr = request(token, "GET", API + "/repos/" + repo + "/pulls/" + str(pr_number))
+    final_head_sha = ((final_pr.get("head") or {}).get("sha"))
+    head_stable = final_head_sha == expected_sha
+    head_errors = [] if head_stable else [
+        f"PR head changed during collection: final={final_head_sha} expected={expected_sha}"
+    ]
+    final_base = _pr_base_binding(final_pr)
+    final_base_ok = (
+        bool(expected_base_ref)
+        and _repo_key(final_base.get("repository")) == repo.lower()
+        and final_base.get("ref") == expected_base_ref
+    )
+    base_identity_stable = _base_identity(initial_base) == _base_identity(final_base)
+    base_ok = initial_base_ok and final_base_ok and base_identity_stable
+    base_errors: list[str] = []
+    base_errors.extend(initial_base_errors)
+    if not final_base_ok:
+        base_errors.append(
+            "final PR base is not the protected repository default branch: "
+            f"observed={_repo_key(final_base.get('repository'))}:{final_base.get('ref')} "
+            f"expected={repo.lower()}:{expected_base_ref}"
+        )
+    if not base_identity_stable:
+        base_changed_error = (
+            "PR base changed during collection: "
+            f"initial={_repo_key(initial_base.get('repository'))}:{initial_base.get('ref')}@{initial_base.get('sha')} "
+            f"final={_repo_key(final_base.get('repository'))}:{final_base.get('ref')}@{final_base.get('sha')}"
+        )
+        base_errors.append(base_changed_error)
+        if initial_base_ok and final_base_ok:
+            unknown_reasons.append(base_changed_error)
+    strict_sync_stale = False
+    if strict_sync_required and strict_sync_evidence.get("availability") == "observed":
+        compared_base_sha = strict_sync_evidence.get("base_sha")
+        if final_base.get("sha") != compared_base_sha:
+            strict_sync_stale = True
+            strict_sync_outcome = (
+                "INDETERMINATE"
+                if strict_sync_outcome == "SATISFIED"
+                else strict_sync_outcome
+            )
+            stale_error = (
+                "strict required-check synchronization evidence stale: "
+                f"compared_base_sha={compared_base_sha} "
+                f"final_base_sha={final_base.get('sha')}"
+            )
+            strict_sync_errors.append(stale_error)
+            unknown_reasons.append(stale_error)
+
+    evidence = {
+        "head_sha": ((pr.get("head") or {}).get("sha")),
+        "final_head_sha": final_head_sha,
+        "base": initial_base,
+        "final_base": final_base,
+        "latest_push": push_evidence,
+        "observed_push_event_provenance": observed_push_event_provenance,
+        "caller_supplied_latest_push_actor": trusted_latest_push_actor,
+        "reviewer_permissions": reviewer_permissions,
+        "review_ids": [r.get("id") for r in reviews if r.get("id") is not None],
+        "review_gate": review_gate,
+        "strict_required_status_checks_policy": strict_policy,
+        "strict_required_check_synchronization": strict_sync_evidence,
+        "required_checks": aggregate.get("status_checks") or [],
+        "check_runs": [
+            {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "head_sha": r.get("head_sha"),
+                "status": r.get("status"),
+                "conclusion": r.get("conclusion"),
+                "app_id": ((r.get("app") or {}).get("id")),
+                "check_suite_id": _check_suite_id(r),
+            }
+            for r in check_evidence.get("check_runs") or []
+        ],
+        "workflow_runs": [
+            {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "workflow_id": r.get("workflow_id"),
+                "path": r.get("path"),
+                "check_suite_id": r.get("check_suite_id"),
+                "event": r.get("event"),
+                "run_number": r.get("run_number"),
+                "run_attempt": r.get("run_attempt"),
+                "status": r.get("status"),
+                "conclusion": r.get("conclusion"),
+                "head_sha": r.get("head_sha"),
+            }
+            for r in runs
+        ],
+    }
+
+    debt: list[dict] = []
+    if not governed_repo_ok:
+        debt.append(_operator_debt(
+            "governed-repository-hold", repo, "snapshot repository is outside the manifest",
+            [{"kind": "policy", "repository": repo}],
+        ))
+    if not protection_ok:
+        debt.append(_operator_debt(
+            "protection-hold", repo, "; ".join(protection_errors),
+            [{"kind": "protection", "repository": repo, "classic_state": protection.get("classic_state")}],
+        ))
+    if not approval_ok:
+        debt.append(_operator_debt(
+            "exact-head-review-hold", repo + "#" + str(pr_number),
+            "; ".join(permission_errors + approval_errors + ([push_error] if push_error else []) + ([review_gate_error] if review_gate_error else [])),
+            [{"kind": "pull_request", "number": pr_number, "head_sha": evidence["head_sha"]}],
+        ))
+    if not threads_ok:
+        debt.append(_operator_debt(
+            "review-thread-hold", repo + "#" + str(pr_number),
+            "; ".join(thread_errors or ["review thread evidence incomplete"]),
+            [{"kind": "review_threads", "state": review_gate.get("collection_state")}],
+        ))
+    if check_outcome != "SATISFIED":
+        debt.append(_operator_debt(
+            "required-check-hold", expected_sha, "; ".join(check_errors),
+            [{"kind": "required_check", **item} for item in evidence["required_checks"]],
+        ))
+    if strict_sync_outcome != "SATISFIED":
+        debt.append(_operator_debt(
+            "strict-required-check-sync-hold", expected_sha, "; ".join(strict_sync_errors),
+            [{"kind": "strict_required_check_synchronization", **strict_sync_evidence}],
+        ))
+    if not workflow_ok:
+        debt.append(_operator_debt(
+            "workflow-hold", expected_sha, "; ".join(workflow_errors),
+            [{"kind": "workflow_run", **item} for item in evidence["workflow_runs"]],
+        ))
+    if not base_ok:
+        debt.append(_operator_debt(
+            "protected-base-hold", repo + "#" + str(pr_number), "; ".join(base_errors),
+            [
+                {
+                    "kind": "pull_request",
+                    "number": pr_number,
+                    "base": initial_base,
+                    "final_base": final_base,
+                }
+            ],
+        ))
+    if not head_stable:
+        debt.append(_operator_debt(
+            "head-stability-hold", repo + "#" + str(pr_number), "; ".join(head_errors),
+            [{"kind": "pull_request", "number": pr_number, "final_head_sha": final_head_sha}],
+        ))
+
+    definite_failures = []
+    if not governed_repo_ok:
+        definite_failures.append("repository outside manifest")
+    if protection.get("complete") and not protection_ok:
+        definite_failures.append("protection control unsatisfied")
+    if (
+        not permission_errors
+        and not push_error
+        and not review_gate_error
+        and not approval_indeterminate_errors
+        and not approval_ok
+    ):
+        definite_failures.append("review control unsatisfied")
+    if review_gate_error is None and not threads_ok:
+        definite_failures.append("review thread control unsatisfied")
+    if check_collection_error is None and protection.get("complete") and check_outcome == "UNSATISFIED":
+        definite_failures.append("required check control unsatisfied")
+    if strict_sync_outcome == "UNSATISFIED":
+        definite_failures.append("strict required-check synchronization control unsatisfied")
+    if workflow_collection_error is None and not workflow_ok:
+        definite_failures.append("workflow control unsatisfied")
+    if expected_base_ref and not (initial_base_ok and final_base_ok):
+        definite_failures.append("governed base control unsatisfied")
+    if not head_stable:
+        definite_failures.append("exact head became stale")
+
+    if not head_stable or not base_identity_stable or strict_sync_stale:
+        evidence_state = "STALE"
+    elif unknown_reasons:
+        evidence_state = "UNKNOWN"
+    elif definite_failures:
+        evidence_state = "HOLD"
+    else:
+        evidence_state = "VERIFIED"
+
+    if definite_failures:
+        control_outcome = "UNSATISFIED"
+    elif unknown_reasons:
+        control_outcome = "INDETERMINATE"
+    else:
+        control_outcome = "SATISFIED"
+
+    readiness_status = (
+        "PASS"
+        if evidence_state == "VERIFIED"
+        and control_outcome == "SATISFIED"
+        and not debt
+        and head_stable
+        and base_ok
+        and not strict_sync_stale
+        else "HOLD"
+    )
+
+    return {
+        "schema_version": "github-ops.snapshot.v0.1",
+        "repository": repo,
+        "pull_request": pr_number,
+        "expected_head_sha": expected_sha,
+        "observed_head_sha": evidence["head_sha"],
+        "final_observed_head_sha": final_head_sha,
+        "base_identity_stable": base_identity_stable,
+        "observed_at": collected_at,
+        "collector": {"mode": "read-only", "credential_source": "environment"},
+        "policy": {"version": manifest.get("version"), "sha256": policy_sha256},
+        "evidence_state": evidence_state,
+        "control_outcome": control_outcome,
+        "readiness_status": readiness_status,
+        "completeness": {
+            "protection": "complete" if protection.get("complete") else "partial",
+            "reviews": "complete" if not permission_errors and not review_gate_error else "partial",
+            "checks": "complete" if not check_collection_error else "partial",
+            "workflows": "complete" if not workflow_collection_error else "partial",
+            "push_provenance": "complete" if not push_error else "partial",
+            "strict_required_check_synchronization": (
+                "not_required"
+                if not strict_sync_required
+                else "stale"
+                if strict_sync_stale
+                else "complete"
+                if strict_sync_collection_error is None
+                else "partial"
+            ),
+            "dependencies_security": "not_collected",
+        },
+        "evidence": evidence,
+        "operator_debt": debt,
+        "status": readiness_status,
+    }
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", default=str(DEFAULT_MANIFEST))
+    parser.add_argument("--apply", action="store_true", help="monotonically strengthen the named ruleset")
+    parser.add_argument("--validate-manifest-only", action="store_true")
+    parser.add_argument("--snapshot-json", action="store_true", help="emit a read-only GitHub Ops snapshot")
+    parser.add_argument("--repo")
+    parser.add_argument("--pr-number", type=int)
+    parser.add_argument("--expected-sha")
+    parser.add_argument(
+        "--required-workflow",
+        action="append",
+        default=[],
+        help="required pull_request workflow path or workflow id for exact-head readiness",
+    )
+    args = parser.parse_args()
+
+    try:
+        manifest = json.loads(Path(args.manifest).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: manifest unreadable: {exc}", file=sys.stderr)
+        return 2
+    errors = validate_manifest(manifest)
+    if errors:
+        for item in errors:
+            print(f"ERROR: {item}", file=sys.stderr)
+        return 2
+    if args.validate_manifest_only:
+        print("estate main protection manifest: PASS")
+        return 0
+
+    try:
+        token = select_token()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    if args.snapshot_json:
+        if not args.repo or not args.pr_number or not args.expected_sha or not args.required_workflow:
+            print("ERROR: --snapshot-json requires --repo, --pr-number, --expected-sha, and --required-workflow", file=sys.stderr)
+            return 2
+        if args.repo not in manifest["repositories"]:
+            print("ERROR: snapshot repository is outside the manifest", file=sys.stderr)
+            return 2
+        try:
+            snapshot = build_read_only_snapshot(token, args.repo, args.pr_number, args.expected_sha, args.required_workflow, manifest)
+        except Exception as exc:
+            print(json.dumps({"schema_version": "github-ops.snapshot.v0.1", "status": "HOLD", "error": str(exc)}, sort_keys=True))
+            return 1
+        print(json.dumps(snapshot, sort_keys=True))
+        return 0 if snapshot["status"] == "PASS" else 1
+
+    failed = False
+    for repo in manifest["repositories"]:
+        surface = effective_default_branch_protection(token, repo)
+        ok, drift = validate_effective_protection(surface, manifest, repo)
+        print(f"{repo}: {'PASS' if ok else 'HOLD'}")
+        for item in drift:
+            print(f"  - {item}")
+
+        if args.apply and not ok:
+            if not surface.get("complete"):
+                failed = True
+                print("  APPLY REFUSED: effective state incomplete")
+                continue
+            all_rulesets = list_all_rulesets(token, repo)
+            named = find_named_ruleset(all_rulesets, manifest["ruleset_name"])
+            if named:
+                applies = ref_condition_applies(named, surface["default_branch"])
+                if applies is not True:
+                    failed = True
+                    print("  APPLY REFUSED: named ruleset does not target default branch")
+                    continue
+                payload = update_payload(named, manifest, repo)
+                request(token, "PUT", f"{API}/repos/{repo}/rulesets/{named['id']}", payload)
+                print("  applied: monotonic pull-request strengthening; non-PR rules preserved")
+            else:
+                request(token, "POST", f"{API}/repos/{repo}/rulesets", create_payload(manifest, repo))
+                print("  applied: created restrictive baseline ruleset")
+            refreshed = effective_default_branch_protection(token, repo)
+            verified, remaining = validate_effective_protection(refreshed, manifest, repo)
+            if not verified:
+                failed = True
+                print("  VERIFY HOLD")
+                for item in remaining:
+                    print(f"    - {item}")
+            else:
+                print("  verify: PASS")
+        elif not ok:
+            failed = True
+
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
