@@ -24,6 +24,7 @@ from pathlib import Path
 API = "https://api.github.com"
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "manifests" / "estate-main-protection.v0.1.json"
+CONFIRMED_404 = {"github_api_state": "absent_404_confirmed"}
 
 RESTRICTIVE_TRUE_KEYS = {
     "dismiss_stale_reviews_on_push",
@@ -72,7 +73,7 @@ def request(token: str, method: str, url: str, payload=None, allow_404: bool = F
             return json.loads(body) if body else None
     except urllib.error.HTTPError as exc:
         if allow_404 and exc.code == 404:
-            return None
+            return dict(CONFIRMED_404)
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"GitHub {method} {url} failed: {exc.code} {detail}") from exc
 
@@ -251,6 +252,37 @@ def ref_condition_applies(ruleset: dict, default_branch: str) -> bool | None:
     return False
 
 
+def _is_confirmed_404(payload) -> bool:
+    return isinstance(payload, dict) and payload.get("github_api_state") == "absent_404_confirmed"
+
+
+def _classic_bypass_visibility_diagnostics(classic: dict) -> list[str]:
+    diagnostics: list[str] = []
+    enforce_admins = classic.get("enforce_admins")
+    if not isinstance(enforce_admins, dict) or not isinstance(enforce_admins.get("enabled"), bool):
+        diagnostics.append("classic protection enforce_admins.enabled unavailable or malformed")
+
+    reviews = classic.get("required_pull_request_reviews")
+    if reviews is None:
+        return diagnostics
+    if not isinstance(reviews, dict):
+        diagnostics.append("classic required_pull_request_reviews payload malformed")
+        return diagnostics
+    if not reviews:
+        return diagnostics
+
+    allowances = reviews.get("bypass_pull_request_allowances")
+    if not isinstance(allowances, dict):
+        diagnostics.append("classic pull request bypass allowances unavailable or malformed")
+        return diagnostics
+    for actor_type in ("users", "teams", "apps"):
+        if actor_type not in allowances or not isinstance(allowances.get(actor_type), list):
+            diagnostics.append(
+                f"classic pull request bypass allowances {actor_type} unavailable or malformed"
+            )
+    return diagnostics
+
+
 def effective_default_branch_protection(token: str, repo: str) -> dict:
     repo_info = request(token, "GET", f"{API}/repos/{repo}")
     if not isinstance(repo_info, dict):
@@ -281,10 +313,15 @@ def effective_default_branch_protection(token: str, repo: str) -> dict:
     classic_state = "unknown"
     try:
         classic = request(token, "GET", f"{API}/repos/{repo}/branches/{encoded_branch}/protection", allow_404=True)
-        if classic is None:
-            classic_state = "absent"
+        if _is_confirmed_404(classic):
+            classic_state = "absent_404_confirmed"
+            classic = None
         elif isinstance(classic, dict):
             classic_state = "observed"
+            diagnostics.extend(_classic_bypass_visibility_diagnostics(classic))
+        elif classic is None:
+            diagnostics.append("classic protection response empty without confirmed 404")
+            classic_state = "unknown"
         else:
             diagnostics.append("classic protection payload malformed")
             classic_state = "malformed"
@@ -391,11 +428,30 @@ def _aggregate_effective(surface: dict) -> dict:
                 "required_review_thread_resolution": (classic.get("required_conversation_resolution") or {}).get("enabled", False),
             }
             aggregate["review"] = merge_restrictive_policy(aggregate["review"], classic_policy)
-        if (classic.get("enforce_admins") or {}).get("enabled") is not True:
-            aggregate["bypass_actors"].append({"kind": "classic_admin_bypass"})
+        enforce_admins = classic.get("enforce_admins")
+        if isinstance(enforce_admins, dict) and enforce_admins.get("enabled") is not True:
+            aggregate["bypass_actors"].append(
+                {
+                    "kind": "classic_admin_bypass",
+                    "enabled": enforce_admins.get("enabled"),
+                    "source": "classic_branch_protection.enforce_admins.enabled",
+                }
+            )
         allowances = reviews.get("bypass_pull_request_allowances") or {}
-        if any(allowances.get(kind) for kind in ("users", "teams", "apps")):
-            aggregate["bypass_actors"].append({"kind": "classic_pull_request_bypass"})
+        for actor_type in ("users", "teams", "apps"):
+            actors = allowances.get(actor_type) or []
+            if actors:
+                aggregate["bypass_actors"].append(
+                    {
+                        "kind": "classic_pull_request_bypass",
+                        "actor_type": actor_type,
+                        "actors": actors,
+                        "source": (
+                            "classic_branch_protection.required_pull_request_reviews."
+                            f"bypass_pull_request_allowances.{actor_type}"
+                        ),
+                    }
+                )
         checks = classic.get("required_status_checks") or {}
         for check in checks.get("checks") or []:
             context = check.get("context")
@@ -523,6 +579,15 @@ def _permission_value(value) -> str | None:
     return None
 
 
+def _has_authoritative_reviewer_constraint_receipt(effective_review: dict) -> bool:
+    receipt = effective_review.get("strong_reviewer_constraint_receipt")
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("state") == "satisfied"
+        and bool(receipt.get("source"))
+    )
+
+
 def evaluate_exact_head_approval(
     pr: dict,
     reviews: list[dict],
@@ -538,7 +603,7 @@ def evaluate_exact_head_approval(
     if current != expected_sha:
         return False, [f"PR head mismatch: current={current} expected={expected_sha}"]
     if not latest_push_actor:
-        errors.append("authoritative latest push actor evidence unavailable")
+        errors.append("observed latest push actor provenance unavailable")
     author = (((pr.get("user") or {}).get("login")) or "").lower()
     pusher = (latest_push_actor or "").lower()
     eligible: set[str] = set()
@@ -562,10 +627,9 @@ def evaluate_exact_head_approval(
         effective_review.get("require_code_owner_review")
         or effective_review.get("required_reviewers")
     )
-    if stronger_reviewer_constraint and review_decision != "APPROVED":
+    if stronger_reviewer_constraint and not _has_authoritative_reviewer_constraint_receipt(effective_review):
         errors.append(
-            "authoritative GitHub review decision does not prove effective "
-            "code-owner/required-reviewer constraints satisfied"
+            "direct authoritative code-owner/required-reviewer constraint receipt unavailable"
         )
     return not errors, errors
 
@@ -665,12 +729,14 @@ def read_latest_push_evidence(token: str, repo: str, pr: dict, expected_sha: str
                 )
     actors = {item["actor"] for item in matches}
     if not matches:
-        raise RuntimeError("authoritative push event for exact PR head not found")
+        raise RuntimeError("observed PushEvent provenance for exact PR head not found")
     if len(actors) != 1:
-        raise RuntimeError(f"ambiguous authoritative push actors for exact PR head: {sorted(actors)}")
+        raise RuntimeError(f"ambiguous observed PushEvent actors for exact PR head: {sorted(actors)}")
     receipt_bytes = json.dumps(matches, sort_keys=True, separators=(",", ":")).encode()
     return {
         **max(matches, key=lambda item: (item.get("event_timestamp") or "", item.get("event_id") or "")),
+        "availability": "observed",
+        "authority": "repository_events_observed_not_fully_authoritative",
         "source_receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
     }
 
@@ -678,11 +744,106 @@ def read_latest_push_evidence(token: str, repo: str, pr: dict, expected_sha: str
 def read_required_check_evidence(token: str, repo: str, expected_sha: str) -> dict:
     check_runs = paginate_object_items(
         token,
-        f"{API}/repos/{repo}/commits/{expected_sha}/check-runs?filter=latest",
+        f"{API}/repos/{repo}/commits/{expected_sha}/check-runs?filter=all",
         "check_runs",
     )
     statuses = paginate(token, f"{API}/repos/{repo}/commits/{expected_sha}/statuses")
     return {"check_runs": check_runs, "statuses": statuses}
+
+
+def _int_order(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_suite_id(check_run: dict):
+    suite = check_run.get("check_suite") or {}
+    return suite.get("id") or check_run.get("check_suite_id")
+
+
+def _workflow_run_matches_required(workflow_run: dict, required_workflows: list[str]) -> bool:
+    if not required_workflows:
+        return True
+    identifiers = {
+        str(workflow_run.get("name") or ""),
+        str(workflow_run.get("path") or ""),
+        str(workflow_run.get("workflow_id") or ""),
+    }
+    return any(str(required) in identifiers for required in required_workflows)
+
+
+def _github_actions_identity(app: dict) -> bool | None:
+    if not isinstance(app, dict):
+        return None
+    observed = [
+        str(app.get("slug") or "").lower(),
+        str(app.get("name") or "").lower(),
+    ]
+    if "github-actions" in observed or "github actions" in observed:
+        return True
+    if app.get("id") is None and not any(observed):
+        return None
+    if any(observed):
+        return False
+    return None
+
+
+def _workflow_run_chronology(workflow_run: dict) -> tuple[int, int, int]:
+    return (
+        _int_order(workflow_run.get("run_number")),
+        _int_order(workflow_run.get("id")),
+        _int_order(workflow_run.get("run_attempt")),
+    )
+
+
+def _resolve_workflow_for_check_run(
+    check_run: dict,
+    workflow_runs: list[dict],
+    expected_sha: str,
+    required_workflows: list[str],
+) -> tuple[dict | None, str | None]:
+    context = check_run.get("name")
+    suite_id = _check_suite_id(check_run)
+    if suite_id is None:
+        return None, f"check suite provenance unavailable for required check: {context}"
+    candidates = [
+        run for run in workflow_runs
+        if run.get("check_suite_id") == suite_id
+        and run.get("head_sha") == expected_sha
+        and run.get("event") == "pull_request"
+        and _workflow_run_matches_required(run, required_workflows)
+    ]
+    if not candidates:
+        return None, f"workflow provenance unavailable for required check: {context}"
+    for run in candidates:
+        missing = [
+            field for field in ("id", "workflow_id", "path", "run_number", "run_attempt")
+            if run.get(field) is None
+        ]
+        if missing:
+            return None, (
+                f"workflow provenance incomplete for required check: {context} "
+                f"missing={','.join(missing)}"
+            )
+    latest_key = max(_workflow_run_chronology(run) for run in candidates)
+    latest = [run for run in candidates if _workflow_run_chronology(run) == latest_key]
+    if len(latest) != 1:
+        return None, f"workflow provenance ambiguous for required check: {context}"
+    return latest[0], None
+
+
+def _check_run_time_order(check_run: dict) -> tuple[str, str, int]:
+    return (
+        check_run.get("completed_at") or "",
+        check_run.get("started_at") or "",
+        _int_order(check_run.get("id")),
+    )
+
+
+def _workflow_bound_check_run_order(check_run: dict, workflow_run: dict) -> tuple[int, int, int, str, str, int]:
+    return (*_workflow_run_chronology(workflow_run), *_check_run_time_order(check_run))
 
 
 def evaluate_required_checks(
@@ -690,9 +851,12 @@ def evaluate_required_checks(
     check_runs: list[dict],
     statuses: list[dict],
     expected_sha: str,
+    workflow_runs: list[dict] | None = None,
+    required_workflows: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     errors: list[str] = []
     indeterminate: list[str] = []
+    required_workflows = required_workflows or []
     for required in required_checks:
         context = required.get("context")
         producer = required.get("producer") or {}
@@ -704,48 +868,89 @@ def evaluate_required_checks(
         if bound is None:
             indeterminate.append(f"required check producer visibility unavailable: {context}")
             continue
+        if bound is not True:
+            indeterminate.append(f"required check producer unbound for context-only evidence: {context}")
+            continue
         exact_runs = [
             run for run in check_runs
             if run.get("name") == context and run.get("head_sha") == expected_sha
         ]
-        if bound:
-            matching = [
-                run for run in exact_runs
-                if ((run.get("app") or {}).get("id")) == producer_id
-            ]
-            if not matching:
-                if exact_runs:
-                    errors.append(
-                        f"required check producer mismatch: {context} expected_producer={producer_id}"
+        matching = [
+            run for run in exact_runs
+            if ((run.get("app") or {}).get("id")) == producer_id
+        ]
+        if not matching:
+            if exact_runs:
+                errors.append(
+                    f"required check producer mismatch: {context} expected_producer={producer_id}"
+                )
+            else:
+                errors.append(f"required check missing: {context}")
+            continue
+        if workflow_runs is not None:
+            workflow_bound: list[tuple[dict, dict]] = []
+            external_runs: list[dict] = []
+            provider_errors: list[str] = []
+            for run in matching:
+                workflow_run, mapping_error = _resolve_workflow_for_check_run(
+                    run, workflow_runs, expected_sha, required_workflows
+                )
+                if workflow_run is not None:
+                    workflow_bound.append((run, workflow_run))
+                    continue
+                github_actions = _github_actions_identity(run.get("app") or {})
+                if github_actions is False:
+                    external_runs.append(run)
+                    continue
+                if github_actions is True:
+                    provider_errors.append(
+                        mapping_error or f"workflow provenance unavailable for required check: {context}"
                     )
                 else:
-                    errors.append(f"required check missing: {context}")
+                    provider_errors.append(
+                        "required check provider identity unavailable and "
+                        + (mapping_error or f"workflow provenance unavailable for required check: {context}")
+                    )
+            if workflow_bound and external_runs:
+                provider_errors.append(f"required check provider provenance ambiguous: {context}")
+            if provider_errors:
+                indeterminate.extend(provider_errors)
                 continue
-            latest = max(
-                matching,
-                key=lambda run: (
-                    run.get("completed_at") or run.get("started_at") or "",
-                    int(run.get("id") or 0),
-                ),
-            )
-            if latest.get("status") != "completed" or latest.get("conclusion") != "success":
-                errors.append(
-                    f"required check non-success: {context} "
-                    f"status={latest.get('status')} conclusion={latest.get('conclusion')}"
+            if workflow_bound:
+                latest_key = max(
+                    _workflow_bound_check_run_order(run, workflow)
+                    for run, workflow in workflow_bound
                 )
-            continue
-        matching_statuses = [status for status in statuses if status.get("context") == context]
-        observations = [
-            ("check_run", run.get("status") == "completed" and run.get("conclusion") == "success")
-            for run in exact_runs
-        ] + [
-            ("commit_status", status.get("state") == "success")
-            for status in matching_statuses
-        ]
-        if not observations:
-            errors.append(f"required check missing: {context}")
-        elif not all(ok for _, ok in observations):
-            errors.append(f"required check has non-success exact-head evidence: {context}")
+                latest_pairs = [
+                    (run, workflow)
+                    for run, workflow in workflow_bound
+                    if _workflow_bound_check_run_order(run, workflow) == latest_key
+                ]
+                if len(latest_pairs) != 1:
+                    indeterminate.append(f"required check chronology ambiguous: {context}")
+                    continue
+                latest = latest_pairs[0][0]
+            elif external_runs:
+                latest = max(external_runs, key=_check_run_time_order)
+            else:
+                indeterminate.append(f"required check provider provenance unavailable: {context}")
+                continue
+        else:
+            provider_errors = []
+            for run in matching:
+                if _github_actions_identity(run.get("app") or {}) is None:
+                    provider_errors.append(f"required check provider identity unavailable: {context}")
+                elif _github_actions_identity(run.get("app") or {}) is True:
+                    provider_errors.append(f"workflow provenance unavailable for required check: {context}")
+            if provider_errors:
+                indeterminate.extend(provider_errors)
+                continue
+            latest = max(matching, key=_check_run_time_order)
+        if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+            errors.append(
+                f"required check non-success: {context} "
+                f"status={latest.get('status')} conclusion={latest.get('conclusion')}"
+            )
     if errors:
         return "UNSATISFIED", errors + indeterminate
     if indeterminate:
@@ -802,9 +1007,9 @@ def evaluate_latest_runs(
             candidates,
             key=lambda r: (
                 int(r.get("run_number") or 0),
-                r.get("created_at") or "",
                 int(r.get("id") or 0),
                 int(r.get("run_attempt") or 1),
+                r.get("created_at") or "",
             ),
         )
         if latest.get("status") != "completed" or latest.get("conclusion") != "success":
@@ -870,16 +1075,22 @@ def build_read_only_snapshot(
 
     try:
         push_evidence = read_latest_push_evidence(token, repo, pr, expected_sha)
+        observed_push_event_provenance = push_evidence
         push_error = None
     except Exception as exc:
         push_evidence = None
         push_error = str(exc)
+        observed_push_event_provenance = {
+            "availability": "unavailable",
+            "authority": "repository_events_observed_not_fully_authoritative",
+            "error": push_error,
+        }
         unknown_reasons.append("latest push provenance unavailable: " + push_error)
 
     if trusted_latest_push_actor and push_evidence:
         if trusted_latest_push_actor.lower() != (push_evidence.get("actor") or "").lower():
             unknown_reasons.append(
-                "caller-supplied latest push actor conflicts with authoritative GitHub push evidence"
+                "caller-supplied latest push actor conflicts with observed GitHub push provenance"
             )
 
     try:
@@ -912,18 +1123,23 @@ def build_read_only_snapshot(
         unknown_reasons.append("required-check evidence unavailable: " + check_collection_error)
 
     required_count = int((aggregate.get("review") or {}).get("required_approving_review_count") or 0)
-    authoritative_push_actor = (push_evidence or {}).get("actor")
+    observed_push_actor = (push_evidence or {}).get("actor")
     approval_ok, approval_errors = evaluate_exact_head_approval(
         pr,
         reviews,
         expected_sha,
-        authoritative_push_actor,
+        observed_push_actor,
         reviewer_permissions,
         required_count,
         aggregate.get("review") or {},
         review_gate.get("review_decision"),
     )
-    if permission_errors or push_error or review_gate_error:
+    approval_indeterminate_errors = [
+        error for error in approval_errors
+        if "constraint receipt unavailable" in error
+    ]
+    unknown_reasons.extend(approval_indeterminate_errors)
+    if permission_errors or push_error or review_gate_error or approval_indeterminate_errors:
         approval_ok = False
 
     if workflow_collection_error:
@@ -934,15 +1150,17 @@ def build_read_only_snapshot(
 
     protection_ok, protection_errors = validate_effective_protection(protection, manifest)
 
-    if check_collection_error or not protection.get("complete"):
+    if check_collection_error or not protection.get("complete") or workflow_collection_error:
         check_outcome = "INDETERMINATE"
-        check_errors = ["required-check evaluation lacks complete protection/check evidence"]
+        check_errors = ["required-check evaluation lacks complete protection/check/workflow evidence"]
     else:
         check_outcome, check_errors = evaluate_required_checks(
             aggregate.get("status_checks") or [],
             check_evidence.get("check_runs") or [],
             check_evidence.get("statuses") or [],
             expected_sha,
+            runs,
+            required_workflows,
         )
         if check_outcome == "INDETERMINATE":
             unknown_reasons.extend(check_errors)
@@ -983,6 +1201,7 @@ def build_read_only_snapshot(
         "head_sha": ((pr.get("head") or {}).get("sha")),
         "final_head_sha": final_head_sha,
         "latest_push": push_evidence,
+        "observed_push_event_provenance": observed_push_event_provenance,
         "caller_supplied_latest_push_actor": trusted_latest_push_actor,
         "reviewer_permissions": reviewer_permissions,
         "review_ids": [r.get("id") for r in reviews if r.get("id") is not None],
@@ -996,6 +1215,7 @@ def build_read_only_snapshot(
                 "status": r.get("status"),
                 "conclusion": r.get("conclusion"),
                 "app_id": ((r.get("app") or {}).get("id")),
+                "check_suite_id": _check_suite_id(r),
             }
             for r in check_evidence.get("check_runs") or []
         ],
@@ -1005,6 +1225,7 @@ def build_read_only_snapshot(
                 "name": r.get("name"),
                 "workflow_id": r.get("workflow_id"),
                 "path": r.get("path"),
+                "check_suite_id": r.get("check_suite_id"),
                 "event": r.get("event"),
                 "run_number": r.get("run_number"),
                 "run_attempt": r.get("run_attempt"),
@@ -1065,7 +1286,13 @@ def build_read_only_snapshot(
         definite_failures.append("repository outside manifest")
     if protection.get("complete") and not protection_ok:
         definite_failures.append("protection control unsatisfied")
-    if not permission_errors and not push_error and not review_gate_error and not approval_ok:
+    if (
+        not permission_errors
+        and not push_error
+        and not review_gate_error
+        and not approval_indeterminate_errors
+        and not approval_ok
+    ):
         definite_failures.append("review control unsatisfied")
     if review_gate_error is None and not threads_ok:
         definite_failures.append("review thread control unsatisfied")
@@ -1082,7 +1309,7 @@ def build_read_only_snapshot(
         evidence_state = "STALE"
     elif unknown_reasons:
         evidence_state = "UNKNOWN"
-    elif not governed_repo_ok:
+    elif definite_failures:
         evidence_state = "HOLD"
     else:
         evidence_state = "VERIFIED"

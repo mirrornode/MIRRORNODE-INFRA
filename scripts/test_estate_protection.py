@@ -242,6 +242,40 @@ def test_enforces_effective_approval_count():
     assert not ok
 
 
+def test_code_owner_review_needs_direct_constraint_receipt():
+    pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
+    reviews = [{"id": 1, "submitted_at": "2026-01-01", "state": "APPROVED", "commit_id": "new", "user": {"login": "reviewer"}}]
+    ok, errors = mod.evaluate_exact_head_approval(
+        pr,
+        reviews,
+        "new",
+        "pusher",
+        {"reviewer": "write"},
+        1,
+        {"require_code_owner_review": True},
+        "APPROVED",
+    )
+    assert not ok
+    assert any("constraint receipt" in error for error in errors)
+
+
+def test_required_reviewers_need_direct_constraint_receipt():
+    pr = {"head": {"sha": "new"}, "user": {"login": "author"}}
+    reviews = [{"id": 1, "submitted_at": "2026-01-01", "state": "APPROVED", "commit_id": "new", "user": {"login": "reviewer"}}]
+    ok, errors = mod.evaluate_exact_head_approval(
+        pr,
+        reviews,
+        "new",
+        "pusher",
+        {"reviewer": "write"},
+        1,
+        {"required_reviewers": [{"type": "Team", "id": 7}]},
+        "APPROVED",
+    )
+    assert not ok
+    assert any("constraint receipt" in error for error in errors)
+
+
 def test_rejects_latest_pending_or_failing_run_after_historical_success():
     runs = [
         {"id": 1, "name": "CI", "run_attempt": 1, "created_at": "2026-01-01", "status": "completed", "conclusion": "success"},
@@ -316,15 +350,34 @@ def test_classic_branch_name_is_percent_encoded_as_one_segment():
         if url.endswith("/repos/mirrornode/example"):
             return {"default_branch": "release/v1"}
         if "/branches/release%2Fv1/protection" in url:
-            return None
+            return dict(mod.CONFIRMED_404)
         raise AssertionError(url)
     mod.request = fake_request
     mod.list_all_rulesets = lambda token, repo: []
     try:
         result = mod.effective_default_branch_protection("t", "mirrornode/example")
         assert result["complete"] is True
-        assert result["classic_state"] == "absent"
+        assert result["classic_state"] == "absent_404_confirmed"
         assert any("/branches/release%2Fv1/protection" in url for url in seen)
+    finally:
+        mod.request, mod.list_all_rulesets = originals
+
+
+def test_classic_none_is_unknown_not_confirmed_absence():
+    originals = (mod.request, mod.list_all_rulesets)
+    def fake_request(token, method, url, payload=None, allow_404=False):
+        if url.endswith("/repos/mirrornode/example"):
+            return {"default_branch": "main"}
+        if "/branches/main/protection" in url:
+            return None
+        raise AssertionError(url)
+    mod.request = fake_request
+    mod.list_all_rulesets = lambda token, repo: []
+    try:
+        result = mod.effective_default_branch_protection("t", "mirrornode/example")
+        assert result["complete"] is False
+        assert result["classic_state"] == "unknown"
+        assert any("confirmed 404" in item for item in result["diagnostics"])
     finally:
         mod.request, mod.list_all_rulesets = originals
 
@@ -354,7 +407,7 @@ def test_missing_bypass_field_is_not_empty_bypass_list():
         if url.endswith("/repos/mirrornode/example"):
             return {"default_branch": "main"}
         if "/branches/main/protection" in url:
-            return None
+            return dict(mod.CONFIRMED_404)
         raise AssertionError(url)
     mod.request = fake_request
     mod.list_all_rulesets = lambda token, repo: [{"id": 1, "target": "branch", "enforcement": "active", "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}, "rules": []}]
@@ -366,6 +419,48 @@ def test_missing_bypass_field_is_not_empty_bypass_list():
         assert empty["complete"] is True
     finally:
         mod.request, mod.list_all_rulesets = originals
+
+
+def test_classic_missing_bypass_fields_make_surface_incomplete():
+    originals = (mod.request, mod.list_all_rulesets)
+    def fake_request(token, method, url, payload=None, allow_404=False):
+        if url.endswith("/repos/mirrornode/example"):
+            return {"default_branch": "main"}
+        if "/branches/main/protection" in url:
+            return {
+                "enforce_admins": {"enabled": True},
+                "required_pull_request_reviews": {
+                    "required_approving_review_count": 1,
+                    "bypass_pull_request_allowances": {"users": [], "teams": []},
+                },
+            }
+        raise AssertionError(url)
+    mod.request = fake_request
+    mod.list_all_rulesets = lambda token, repo: []
+    try:
+        result = mod.effective_default_branch_protection("t", "mirrornode/example")
+        assert result["complete"] is False
+        assert any("apps" in item and "bypass allowances" in item for item in result["diagnostics"])
+    finally:
+        mod.request, mod.list_all_rulesets = originals
+
+
+def test_classic_bypass_evidence_preserves_source_visibility():
+    classic = {
+        "enforce_admins": {"enabled": False},
+        "required_pull_request_reviews": {
+            "bypass_pull_request_allowances": {
+                "users": [{"login": "ops"}],
+                "teams": [],
+                "apps": [{"slug": "deploy"}],
+            }
+        },
+    }
+    evidence = mod._aggregate_effective({"repository": {}, "rulesets": [], "classic": classic})["bypass_actors"]
+    sources = {item.get("source") for item in evidence}
+    assert "classic_branch_protection.enforce_admins.enabled" in sources
+    assert "classic_branch_protection.required_pull_request_reviews.bypass_pull_request_allowances.users" in sources
+    assert "classic_branch_protection.required_pull_request_reviews.bypass_pull_request_allowances.apps" in sources
 
 
 def test_classic_linear_history_contributes_required_rule():
@@ -399,6 +494,96 @@ def test_unknown_required_check_producer_holds():
     assert any("producer visibility" in error for error in errors)
 
 
+def test_read_required_check_evidence_requests_all_check_runs():
+    originals = (mod.paginate_object_items, mod.paginate)
+    seen = []
+    def fake_paginate_object_items(token, url, key):
+        seen.append(url)
+        assert key == "check_runs"
+        return []
+    mod.paginate_object_items = fake_paginate_object_items
+    mod.paginate = lambda token, url: []
+    try:
+        mod.read_required_check_evidence("t", "mirrornode/example", "head")
+        assert any("filter=all" in url for url in seen)
+        assert not any("filter=latest" in url for url in seen)
+    finally:
+        mod.paginate_object_items, mod.paginate = originals
+
+
+def test_unbound_required_context_is_indeterminate_even_with_successful_same_named_check():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=None, source="ruleset:1")]
+    runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321}}]
+    statuses = [{"context": "validate", "state": "success"}]
+    outcome, errors = mod.evaluate_required_checks(required, runs, statuses, "head")
+    assert outcome == "INDETERMINATE"
+    assert any("producer unbound" in error for error in errors)
+
+
+def test_bound_non_actions_check_does_not_require_actions_workflow_mapping():
+    required = [mod._required_check_identity("external-ci", producer_kind="integration", producer_id=777, source="ruleset:1")]
+    runs = [{"id": 1, "name": "external-ci", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 777, "slug": "third-party-ci", "name": "Third Party CI"}}]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", [], ["validate"])
+    assert outcome == "SATISFIED"
+    assert errors == []
+
+
+def test_github_actions_check_still_requires_resolved_workflow_provenance():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
+    runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321, "slug": "github-actions", "name": "GitHub Actions"}, "check_suite": {"id": 100}}]
+    workflows = [{"id": 50, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 999, "event": "pull_request", "head_sha": "head", "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success"}]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, ["validate"])
+    assert outcome == "INDETERMINATE"
+    assert any("workflow provenance unavailable" in error for error in errors)
+
+
+def test_unknown_check_provider_without_workflow_mapping_is_indeterminate():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
+    runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321}, "check_suite": {"id": 100}}]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", [], ["validate"])
+    assert outcome == "INDETERMINATE"
+    assert any("provider identity unavailable" in error for error in errors)
+
+
+def test_unrelated_successful_workflow_cannot_satisfy_required_check_gate():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
+    runs = [{"id": 1, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 321}, "check_suite": {"id": 100}}]
+    workflows = [{"id": 50, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 999, "event": "pull_request", "head_sha": "head", "run_number": 1, "run_attempt": 1, "status": "completed", "conclusion": "success"}]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, ["validate"])
+    assert outcome == "INDETERMINATE"
+    assert any("workflow provenance unavailable" in error for error in errors)
+
+
+def test_required_check_newer_failure_outranks_older_retry_success():
+    required = [mod._required_check_identity("validate", producer_kind="integration", producer_id=321, source="ruleset:1")]
+    runs = [
+        {"id": 10, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "success", "completed_at": "2026-01-03", "app": {"id": 321}, "check_suite": {"id": 100}},
+        {"id": 11, "name": "validate", "head_sha": "head", "status": "completed", "conclusion": "failure", "completed_at": "2026-01-02", "app": {"id": 321}, "check_suite": {"id": 101}},
+    ]
+    workflows = [
+        {"id": 50, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 100, "event": "pull_request", "head_sha": "head", "run_number": 7, "run_attempt": 9, "status": "completed", "conclusion": "success"},
+        {"id": 51, "name": "validate", "workflow_id": 9, "path": ".github/workflows/validate.yml", "check_suite_id": 101, "event": "pull_request", "head_sha": "head", "run_number": 8, "run_attempt": 1, "status": "completed", "conclusion": "failure"},
+    ]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", workflows, ["validate"])
+    assert outcome == "UNSATISFIED"
+    assert any("required check non-success" in error for error in errors)
+
+
+def test_required_check_definite_failure_outranks_indeterminate_peer():
+    required = [
+        mod._required_check_identity("external-ci", producer_kind="integration", producer_id=777, source="ruleset:1"),
+        mod._required_check_identity("unknown-ci", producer_kind="integration", producer_id=888, source="ruleset:1"),
+    ]
+    runs = [
+        {"id": 1, "name": "external-ci", "head_sha": "head", "status": "completed", "conclusion": "failure", "app": {"id": 777, "slug": "third-party-ci", "name": "Third Party CI"}},
+        {"id": 2, "name": "unknown-ci", "head_sha": "head", "status": "completed", "conclusion": "success", "app": {"id": 888}},
+    ]
+    outcome, errors = mod.evaluate_required_checks(required, runs, [], "head", [], ["validate"])
+    assert outcome == "UNSATISFIED"
+    assert any("required check non-success" in error for error in errors)
+    assert any("provider identity unavailable" in error for error in errors)
+
+
 def test_review_threads_paginate_to_completion():
     original = mod.request
     calls = []
@@ -428,6 +613,8 @@ def test_latest_push_requires_repo_ref_and_exact_resulting_head():
         evidence = mod.read_latest_push_evidence("t", "mirrornode/example", pr, "head")
         assert evidence["actor"] == "bob"
         assert evidence["resulting_head_sha"] == "head"
+        assert evidence["availability"] == "observed"
+        assert evidence["authority"] == "repository_events_observed_not_fully_authoritative"
     finally:
         mod.paginate = original
 
@@ -452,16 +639,16 @@ def _install_snapshot_fakes(*, head_changes=False, unresolved=False, push_availa
         raise AssertionError(url)
     mod.request = fake_request
     mod.paginate = lambda token, url: [{"id": 22, "state": "APPROVED", "commit_id": "head", "user": {"login": "reviewer"}}]
-    mod.paginate_object_items = lambda token, url, key: [{"id": 33, "name": "CI", "workflow_id": 9, "path": ".github/workflows/ci.yml", "event": "pull_request", "run_number": 2, "run_attempt": 1, "created_at": "2026-01-01", "status": "completed", "conclusion": "success", "head_sha": "head"}]
+    mod.paginate_object_items = lambda token, url, key: [{"id": 33, "name": "CI", "workflow_id": 9, "path": ".github/workflows/ci.yml", "check_suite_id": 9001, "event": "pull_request", "run_number": 2, "run_attempt": 1, "created_at": "2026-01-01", "status": "completed", "conclusion": "success", "head_sha": "head"}]
     mod.read_reviewer_permissions = lambda token, repo, reviews: ({"reviewer": {"permission": "write"}}, [])
     mod.read_review_gate_state = lambda token, repo, number: {"collection_state": "complete", "review_decision": "APPROVED", "total_discovered": 1 if unresolved else 0, "unresolved_current": 1 if unresolved else 0, "unresolved_outdated": 0, "threads": [{"id": "T1", "is_resolved": False, "is_outdated": False}] if unresolved else []}
     if push_available:
-        mod.read_latest_push_evidence = lambda token, repo, pr, sha: {"actor": "pusher", "repository": repo, "ref": "refs/heads/feature", "resulting_head_sha": sha, "event_type": "PushEvent"}
+        mod.read_latest_push_evidence = lambda token, repo, pr, sha: {"actor": "pusher", "repository": repo, "ref": "refs/heads/feature", "resulting_head_sha": sha, "event_type": "PushEvent", "availability": "observed", "authority": "repository_events_observed_not_fully_authoritative"}
     else:
         def no_push(*args):
             raise RuntimeError("push provenance unavailable")
         mod.read_latest_push_evidence = no_push
-    mod.read_required_check_evidence = lambda token, repo, sha: {"check_runs": [{"id": 44, "name": "CI", "head_sha": sha, "status": "completed", "conclusion": "success", "app": {"id": 321}}], "statuses": []}
+    mod.read_required_check_evidence = lambda token, repo, sha: {"check_runs": [{"id": 44, "name": "CI", "head_sha": sha, "status": "completed", "conclusion": "success", "app": {"id": 321}, "check_suite": {"id": 9001}}], "statuses": []}
     good = surface()
     rule = next(r for r in good["rulesets"][0]["rules"] if r["type"] == "required_status_checks")
     rule["parameters"]["required_status_checks"] = [{"context": "CI", "integration_id": 321}]
@@ -477,6 +664,7 @@ def test_read_only_snapshot_binds_verified_evidence_and_latest_runs():
         assert snap["evidence_state"] == "VERIFIED"
         assert snap["control_outcome"] == "SATISFIED"
         assert snap["evidence"]["latest_push"]["actor"] == "pusher"
+        assert snap["evidence"]["observed_push_event_provenance"]["availability"] == "observed"
         assert snap["evidence"]["required_checks"][0]["producer"]["id"] == 321
     finally:
         (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
@@ -490,6 +678,32 @@ def test_snapshot_unknown_push_evidence_cannot_pass():
         assert snap["status"] == "HOLD"
         assert snap["evidence_state"] == "UNKNOWN"
         assert snap["control_outcome"] == "INDETERMINATE"
+        assert snap["evidence"]["observed_push_event_provenance"]["availability"] == "unavailable"
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_snapshot_definite_failure_remains_unsatisfied_with_unrelated_unknown_evidence():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(push_available=False)
+    mod.read_required_check_evidence = lambda token, repo, sha: {"check_runs": [{"id": 44, "name": "CI", "head_sha": sha, "status": "completed", "conclusion": "failure", "app": {"id": 321}, "check_suite": {"id": 9001}}], "statuses": []}
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest(), trusted_latest_push_actor="pusher")
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "UNKNOWN"
+        assert snap["control_outcome"] == "UNSATISFIED"
+    finally:
+        (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
+
+
+def test_known_unresolved_mandatory_control_cannot_emit_overall_verified_evidence_state():
+    originals = (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection)
+    _install_snapshot_fakes(unresolved=True)
+    try:
+        snap = mod.build_read_only_snapshot("t", "mirrornode/example", 7, "head", ["CI"], manifest())
+        assert snap["status"] == "HOLD"
+        assert snap["evidence_state"] == "HOLD"
+        assert snap["control_outcome"] == "UNSATISFIED"
     finally:
         (mod.request, mod.paginate, mod.paginate_object_items, mod.read_reviewer_permissions, mod.read_review_gate_state, mod.read_latest_push_evidence, mod.read_required_check_evidence, mod.effective_default_branch_protection) = originals
 
